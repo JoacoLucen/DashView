@@ -46,15 +46,15 @@ class ETLPipeline:
 
         os.makedirs(os.path.dirname(self.target_db_path), exist_ok=True)
         os.makedirs(self.staging_dir, exist_ok=True)
+        os.makedirs(self.EXTRACTED_DIR, exist_ok=True)
         
-        # Nuevo Esquema Requerido
+        # Esquema Refinado (Incluyendo rating como columna opcional soportada)
         self.REQUIRED_COLUMNS = [
             "date", "year", "month", "customer_action", "sentiment_score", 
-            "sentiment_label", "source", "company", "product_service", "text", "country"
+            "sentiment_label", "source", "company", "product_service", "text", "country", "rating"
         ]
 
     def cleanup_staging(self) -> None:
-        """Limpia la carpeta de staging y extracciones previas."""
         if os.path.exists(self.EXTRACTED_DIR):
             shutil.rmtree(self.EXTRACTED_DIR)
         os.makedirs(self.EXTRACTED_DIR, exist_ok=True)
@@ -65,19 +65,16 @@ class ETLPipeline:
             except: pass
 
     def process_zip_file(self) -> None:
-        """Descomprime el archivo ZIP y procesa el primer archivo válido encontrado."""
         if not zipfile.is_zipfile(self.UPLOADED_ZIP_PATH):
             raise ValueError("El archivo cargado no es un ZIP válido.")
 
         with zipfile.ZipFile(self.UPLOADED_ZIP_PATH, 'r') as zip_ref:
             zip_ofiles = zip_ref.namelist()
-            # Filtrar archivos ocultos o carpetas de sistema (como __MACOSX)
             valid_files = [f for f in zip_ofiles if not f.startswith('__') and os.path.splitext(f)[1].lower() in ['.csv', '.parquet', '.jsonl', '.json']]
             
             if not valid_files:
                 raise FileNotFoundError("No se encontró un archivo .csv, .parquet o .jsonl dentro del ZIP.")
             
-            # Extraer el primer archivo válido
             target_file = valid_files[0]
             zip_ref.extract(target_file, self.EXTRACTED_DIR)
             extracted_path = os.path.join(self.EXTRACTED_DIR, target_file)
@@ -105,14 +102,14 @@ class ETLPipeline:
         self._load_to_sqlite(df_processed)
 
     def _transform_and_clean(self, df: pl.DataFrame) -> pl.DataFrame:
-        # Normalizar columnas
         df.columns = [c.strip().lower() for c in df.columns]
-        req_cols_lower = [c.lower() for c in self.REQUIRED_COLUMNS]
         
-        missing_cols = [col for col in req_cols_lower if col not in df.columns]
-        if missing_cols:
-            raise KeyError(f"Esquema inválido. Faltan: {missing_cols}")
+        # Gestionar columnas faltantes de forma flexible
+        for col in self.REQUIRED_COLUMNS:
+            if col.lower() not in df.columns:
+                df = df.with_columns(pl.lit(None).alias(col.lower()))
 
+        req_cols_lower = [c.lower() for c in self.REQUIRED_COLUMNS]
         df_selected = df.select(req_cols_lower)
         df_selected.columns = self.REQUIRED_COLUMNS
 
@@ -122,11 +119,11 @@ class ETLPipeline:
             pl.col("sentiment_score").cast(pl.Float64, strict=False).fill_null(0.0),
             pl.col("year").cast(pl.Int32, strict=False),
             pl.col("month").cast(pl.Int32, strict=False),
+            pl.col("rating").cast(pl.Float64, strict=False).fill_null(0.0),
             pl.col("text").fill_null(""),
             pl.col("country").fill_null("Unknown")
         ])
 
-        # Asegurar que year/month vengan de la fecha si fallan en el cast
         df_selected = df_selected.with_columns([
             pl.when(pl.col("year").is_null()).then(pl.col("date").dt.year()).otherwise(pl.col("year")).alias("year"),
             pl.when(pl.col("month").is_null()).then(pl.col("date").dt.month()).otherwise(pl.col("month")).alias("month")
@@ -142,14 +139,14 @@ class ETLPipeline:
                 CREATE TABLE IF NOT EXISTS client_signals (
                     date TEXT, year INTEGER, month INTEGER, customer_action TEXT, 
                     sentiment_score REAL, sentiment_label TEXT, source TEXT, 
-                    company TEXT, product_service TEXT, text TEXT, country TEXT
+                    company TEXT, product_service TEXT, text TEXT, country TEXT, rating REAL
                 );
             """)
             cursor.execute("BEGIN TRANSACTION;")
             cursor.execute("DELETE FROM client_signals;") 
             cursor.executemany("""
-                INSERT INTO client_signals (date, year, month, customer_action, sentiment_score, sentiment_label, source, company, product_service, text, country)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                INSERT INTO client_signals (date, year, month, customer_action, sentiment_score, sentiment_label, source, company, product_service, text, country, rating)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, df.iter_rows())
             
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_signals_main ON client_signals (company, year, month);")

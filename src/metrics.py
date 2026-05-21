@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import numpy as np
 import re
+import sqlite3
 from collections import Counter
 
 try:
@@ -15,8 +16,6 @@ class MetricsCalculator:
         Calculador de métricas analíticas corporativas. 
         """
         self.db = db_manager or DatabaseManager()
-        
-        # Diccionario extendido de palabras vacías
         self.STOPWORDS = {
             "el", "la", "los", "las", "un", "una", "unos", "unas", "y", "o", "no", 
             "si", "en", "de", "que", "es", "con", "por", "para", "como", "su", "sus", 
@@ -33,7 +32,8 @@ class MetricsCalculator:
         df_vol = self.db._execute_query(query_vol, filters)
         total_signals = int(df_vol["total"].iloc[0]) if not df_vol.empty else 0
 
-        active_actions = "('complaining', 'churning', 'churning_due_to_price', 'churning_due_to_policy', 'formal_complaint', 'review')"
+        active_actions = "('complaining', 'churning', 'churning_due_to_price', 'churning_due_to_policy', 'formal_complaint', 'positive_review', 'negative_review', 'advocating', 'seeking_help', 'venting', 'sharing_positive_experience', 'reacting_to_price_change', 'reacting_to_policy_change', 'searching_for_alternatives', 'discussing')"
+        
         query_active = f"""
             SELECT 
                 SUM(CASE WHEN customer_action IN {active_actions} THEN 1 ELSE 0 END) as activos,
@@ -63,7 +63,13 @@ class MetricsCalculator:
         }
 
     def get_sentiment_by_channel(self, filters: dict) -> pd.DataFrame:
-        query = "SELECT source, AVG(sentiment_score) as avg_sentiment FROM client_signals GROUP BY source ORDER BY avg_sentiment DESC"
+        query = """
+            SELECT source, AVG(sentiment_score) as avg_sentiment
+            FROM client_signals
+            WHERE sentiment_score IS NOT NULL
+            GROUP BY source
+            ORDER BY avg_sentiment DESC
+        """
         return self.db._execute_query(query, filters)
 
     def get_monthly_activity_peaks(self, filters: dict) -> pd.DataFrame:
@@ -87,6 +93,18 @@ class MetricsCalculator:
         """
         return self.db._execute_query(query, filters)
 
+    def get_user_segmentation_distribution(self, filters: dict) -> pd.DataFrame:
+        query = "SELECT customer_action, COUNT(*) as volumen FROM client_signals GROUP BY customer_action ORDER BY volumen DESC"
+        df = self.db._execute_query(query, filters)
+        if not df.empty:
+            total_volumen = df["volumen"].sum()
+            df["pct"] = (df["volumen"] / total_volumen * 100).round(1)
+        return df
+
+    def get_signals_volume_over_time(self, filters: dict) -> pd.DataFrame:
+        query = "SELECT year, COUNT(*) as volumen FROM client_signals GROUP BY year ORDER BY year ASC"
+        return self.db._execute_query(query, filters)
+
     # =========================================================================
     # TABLA 2: DIRECCIÓN GENERAL
     # =========================================================================
@@ -108,7 +126,7 @@ class MetricsCalculator:
         }
         if not df.empty:
             df["causa_label"] = df["customer_action"].map(mapeo_causas).fillna(df["customer_action"])
-            df["pct"] = (df["cantidad"] / NULLIF_PD(total_churn) * 100).round(1)
+            df["pct"] = (df["cantidad"] / total_churn * 100).round(1) if total_churn > 0 else 0
         
         return {
             "total_churn": total_churn,
@@ -116,12 +134,30 @@ class MetricsCalculator:
         }
 
     def get_competitive_benchmark(self, filters: dict) -> pd.DataFrame:
-        query = "SELECT company, AVG(sentiment_score) as avg_sentiment FROM client_signals GROUP BY company ORDER BY avg_sentiment ASC"
+        query = """
+            SELECT company, AVG(sentiment_score) as avg_sentiment
+            FROM client_signals
+            WHERE sentiment_score IS NOT NULL
+            GROUP BY company
+            HAVING COUNT(*) > 500
+            ORDER BY avg_sentiment ASC
+            LIMIT 15
+        """
         return self.db._execute_query(query, filters)
 
     def get_company_product_heatmap(self, filters: dict) -> pd.DataFrame:
-        query = "SELECT company, product_service, AVG(sentiment_score) as avg_sentiment FROM client_signals GROUP BY company, product_service"
-        return self.db._execute_query(query, filters)
+        query = """
+            SELECT company, product_service, AVG(sentiment_score) as avg_sentiment 
+            FROM client_signals 
+            GROUP BY company, product_service
+            ORDER BY COUNT(*) DESC
+            LIMIT 150
+        """
+        df = self.db._execute_query(query, filters)
+        if not df.empty:
+            top_products = df.groupby("product_service")["avg_sentiment"].count().sort_values(ascending=False).head(8).index
+            df = df[df["product_service"].isin(top_products)]
+        return df
 
     # =========================================================================
     # TABLA 3: RETENCIÓN Y FACTURACIÓN
@@ -139,21 +175,23 @@ class MetricsCalculator:
             df_idx = df.set_index('customer_action').reindex(['complaining', 'formal_complaint'], fill_value=0)
             comp = df_idx.loc['complaining', 'cantidad']
             form = df_idx.loc['formal_complaint', 'cantidad']
-            if comp > 0: 
-                return round((float(form) / float(comp)) * 100, 2)
+            total = comp + form
+            if total > 0: 
+                return round((float(form) / float(total)) * 100, 1)
         return 0.0
 
     def get_average_behavior_cycle(self, filters: dict) -> float:
         query = """
-            SELECT 
-                AVG(JULIANDAY(date_churn) - JULIANDAY(date_neg)) as avg_days
+            SELECT AVG(JULIANDAY(date_churn) - JULIANDAY(date_neg)) as avg_days
             FROM (
-                SELECT product_service, MIN(date) as date_neg, MAX(date) as date_churn
+                SELECT 
+                    source,
+                    MIN(CASE WHEN sentiment_label='negative' THEN date END) as date_neg,
+                    MAX(CASE WHEN customer_action LIKE 'churning%' THEN date END) as date_churn
                 FROM client_signals
-                WHERE sentiment_label = 'negative' OR customer_action LIKE 'churning%'
-                GROUP BY product_service
+                GROUP BY source
             )
-            WHERE date_churn > date_neg
+            WHERE date_churn IS NOT NULL AND date_neg IS NOT NULL AND date_churn > date_neg
         """
         df = self.db._execute_query(query, filters)
         if not df.empty and pd.notna(df["avg_days"].iloc[0]):
@@ -176,20 +214,16 @@ class MetricsCalculator:
             df["norm_vol"] = df["vol"] / max_vol
             df["score"] = ((df["neg_ratio"] * 40) + (df["churn_ratio"] * 40) + (df["norm_vol"] * 20))
             df["score"] = df["score"].round(1).clip(0, 100)
-            # Ordenamos para mostrar los de mayor riesgo y limitamos para que el radar sea legible
             df = df.sort_values(by="score", ascending=False).head(10)
         return df[["product", "score"]]
 
     def get_complaint_topics(self, filters: dict) -> pd.DataFrame:
-        # Aumentamos el límite de registros para procesar y el rango de palabras clave
         query = "SELECT text FROM client_signals WHERE sentiment_label = 'negative' LIMIT 20000"
         df = self.db._execute_query(query, filters)
         
         topics = {"Facturación / Cobros": 0, "Atención / Soporte": 0, "App / Interfaz / UX": 0, "Producto / Calidad": 0}
         if not df.empty:
             texts = df["text"].astype(str).str.lower().fillna("")
-            
-            # Búsqueda más exhaustiva de patrones
             topics["Facturación / Cobros"] = int(texts.str.contains("cobro|tarifa|interes|plata|dinero|pago|factura|precio|price|billing|charge|card|money|bank").sum())
             topics["Atención / Soporte"] = int(texts.str.contains("atencion|soporte|ejecutivo|ayuda|telefono|support|call|espera|atención|agent|help|service").sum())
             topics["App / Interfaz / UX"] = int(texts.str.contains("interfaz|boton|pantalla|color|app|lento|crash|ux|ui|error|login|entrar|acceso|slow").sum())
@@ -199,11 +233,15 @@ class MetricsCalculator:
 
     def get_state_intensity_map(self, filters: dict) -> pd.DataFrame:
         query = """
-            SELECT country as estado, COUNT(*) as quejas 
+            SELECT 
+                REPLACE(REPLACE(country, 'United States - ', ''), 'United States – ', '') as estado, 
+                COUNT(*) as quejas 
             FROM client_signals 
-            WHERE customer_action = 'complaining' 
+            WHERE customer_action IN ('complaining', 'formal_complaint')
+            AND country IS NOT NULL
             GROUP BY country 
             ORDER BY quejas DESC
+            LIMIT 20
         """
         return self.db._execute_query(query, filters)
 
@@ -212,37 +250,36 @@ class MetricsCalculator:
     # =========================================================================
 
     def get_device_usage_comparison(self, filters: dict) -> pd.DataFrame:
-        local_filters = filters.copy()
-        
-        # FIX: Verificación robusta para evitar 'NoneType' object is not iterable
-        sources_filter = local_filters.get("sources")
-        if sources_filter:
-            valid_sources = list(set(sources_filter).intersection({'AppStore', 'GooglePlay'}))
-            local_filters["sources"] = valid_sources if valid_sources else ['AppStore', 'GooglePlay']
-        else:
-            local_filters["sources"] = ['AppStore', 'GooglePlay']
+        # FIX: Verificamos si la columna existe de forma segura
+        has_rating = False
+        try:
+            with sqlite3.connect(self.db.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(client_signals)")
+                columns = [info[1] for info in cursor.fetchall()]
+                has_rating = 'rating' in columns
+        except:
+            pass
 
-        # Intentar detectar columnas dinámicamente (rating puede ser opcional)
-        query = """
-            SELECT source, AVG(sentiment_score) as avg_sentiment
-            FROM client_signals 
-            WHERE source IN ('AppStore', 'GooglePlay') 
-            GROUP BY source
-        """
-        # Nota: Si el usuario quiere rating y no existe, el try-except en app maneja el error
-        return self.db._execute_query(query, local_filters)
+        if has_rating:
+            query = """
+                SELECT source, AVG(rating) as avg_rating, AVG(sentiment_score) as avg_sentiment
+                FROM client_signals 
+                WHERE source IN ('AppStore', 'GooglePlay') 
+                GROUP BY source
+            """
+        else:
+            query = """
+                SELECT source, AVG(sentiment_score) as avg_sentiment
+                FROM client_signals 
+                WHERE source IN ('AppStore', 'GooglePlay') 
+                GROUP BY source
+            """
+        return self.db._execute_query(query, filters)
 
     def get_app_reviews_nlp(self, filters: dict) -> pd.DataFrame:
-        local_filters = filters.copy()
-        sources_filter = local_filters.get("sources")
-        if sources_filter:
-            valid_sources = list(set(sources_filter).intersection({'AppStore', 'GooglePlay'}))
-            local_filters["sources"] = valid_sources if valid_sources else ['AppStore', 'GooglePlay']
-        else:
-            local_filters["sources"] = ['AppStore', 'GooglePlay']
-
         query = "SELECT text FROM client_signals WHERE sentiment_label = 'negative' AND source IN ('AppStore', 'GooglePlay') LIMIT 20000"
-        df = self.db._execute_query(query, local_filters)
+        df = self.db._execute_query(query, filters)
         
         issues = {"Fallas (Crash)": 0, "Lentitud (Slow)": 0, "Errores (Bugs)": 0, "Acceso (Login)": 0}
         if not df.empty:
@@ -255,14 +292,6 @@ class MetricsCalculator:
         return pd.DataFrame(list(issues.items()), columns=["Problema", "Frecuencia"]).sort_values("Frecuencia", ascending=False)
 
     def get_yoy_volume_and_sentiment(self, filters: dict) -> pd.DataFrame:
-        local_filters = filters.copy()
-        sources_filter = local_filters.get("sources")
-        if sources_filter:
-            valid_sources = list(set(sources_filter).intersection({'AppStore', 'GooglePlay'}))
-            local_filters["sources"] = valid_sources if valid_sources else ['AppStore', 'GooglePlay']
-        else:
-            local_filters["sources"] = ['AppStore', 'GooglePlay']
-
         query = """
             SELECT 
                 year, 
@@ -273,8 +302,4 @@ class MetricsCalculator:
             GROUP BY year 
             ORDER BY year ASC
         """
-        return self.db._execute_query(query, local_filters)
-
-def NULLIF_PD(val):
-    """Auxiliar para evitar división por cero en Pandas."""
-    return val if val != 0 else np.nan
+        return self.db._execute_query(query, filters)

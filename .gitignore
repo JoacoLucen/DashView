@@ -2,6 +2,7 @@
 .parquet
 .jsonl
 .zip
+.db
 
 # Excluir la base de datos local y los archivos cargados por los usuarios
 data/dashview.db

@@ -25,7 +25,7 @@ COLOR_NEUTRAL_2 = "#A6A6A6"
 FONT_FAMILY = "Segoe UI, Arial, sans-serif"
 
 def apply_corporate_layout(fig, barmode=None, margin=None, hide_x_title=False, hide_y_title=False):
-    """Aplica las reglas de UI/UX. Permite ocultar títulos redundantes."""
+    """Aplica las reglas de UI/UX. Oculta títulos de ejes si son obvios."""
     default_margin = dict(l=120, r=40, t=60, b=80)
     if margin:
         default_margin.update(margin)
@@ -42,12 +42,12 @@ def apply_corporate_layout(fig, barmode=None, margin=None, hide_x_title=False, h
     )
     fig.update_xaxes(
         showgrid=True, gridcolor='#F0F0F0', 
-        title_text="" if hide_x_title else fig.layout.xaxis.title.text,
+        title_text="" if hide_x_title else None,
         tickfont=dict(family=FONT_FAMILY, size=11)
     )
     fig.update_yaxes(
         showgrid=True, gridcolor='#F0F0F0', 
-        title_text="" if hide_y_title else fig.layout.yaxis.title.text,
+        title_text="" if hide_y_title else None,
         tickfont=dict(family=FONT_FAMILY, size=11)
     )
     return fig
@@ -68,13 +68,17 @@ STYLE_KPI = {
 app = dash.Dash(
     __name__, 
     external_stylesheets=[dbc.themes.BOOTSTRAP, "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css"],
-    title="DashView Analítica Empresarial",
+    title="DashView Analytics",
     suppress_callback_exceptions=True
 )
 
 db_manager = DatabaseManager()
 metrics_calc = MetricsCalculator(db_manager)
 pipeline_etl = ETLPipeline()
+
+# Garantizar estructura de carpetas al arranque
+for path in [pipeline_etl.staging_dir, pipeline_etl.EXTRACTED_DIR]:
+    os.makedirs(path, exist_ok=True)
 
 # =============================================================================
 # 2. LAYOUT
@@ -94,51 +98,57 @@ app.layout = html.Div(style={"backgroundColor": COLOR_BACKGROUND, "fontFamily": 
                     dbc.Button([html.I(className="bi bi-cloud-upload me-2"), "Cambiar Datos"], 
                                id="btn-load-new", color="light", size="sm", className="ms-2 text-dark border")
                 ],
-                color=COLOR_PRIMARY,
-                dark=True, fluid=True, className="mb-4 shadow-sm"
+                color=COLOR_PRIMARY, dark=True, fluid=True, className="mb-4 shadow-sm"
             ),
 
             dbc.Container(fluid=True, children=[
                 html.Div(id="global-alert-container"),
                 
-                # FILTROS
-                dbc.Card(className="mb-4 border-0 shadow-sm", children=dbc.CardBody([
-                    dbc.Row([
-                        dbc.Col(md=2, children=[
-                            html.Label("Período", className="small fw-bold text-muted"),
-                            dcc.RangeSlider(id="filter-period", min=2010, max=2025, step=1, value=[2010, 2025],
-                                            marks={str(y): str(y) for y in range(2010, 2026, 3)})
+                # PANEL DE FILTROS (STICKY)
+                html.Div(style={"position": "sticky", "top": "10px", "zIndex": 1000}, children=[
+                    dbc.Card(className="mb-4 border-0 shadow-lg", children=dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col(md=2, children=[
+                                html.Label("Período", className="small fw-bold text-muted"),
+                                dcc.RangeSlider(id="filter-period", min=2010, max=2025, step=1, value=[2010, 2025],
+                                                marks={str(y): str(y) for y in range(2010, 2026, 3)})
+                            ]),
+                            dbc.Col(md=2, children=[
+                                html.Label("Plataforma", className="small fw-bold text-muted"),
+                                dcc.Dropdown(id="filter-source", multi=True, placeholder="Todas")
+                            ]),
+                            dbc.Col(md=2, children=[
+                                html.Label("Empresa", className="small fw-bold text-muted"),
+                                dcc.Dropdown(id="filter-company", multi=True, placeholder="Todas")
+                            ]),
+                            dbc.Col(md=2, children=[
+                                html.Label("Producto", className="small fw-bold text-muted"),
+                                dcc.Dropdown(id="filter-product", multi=True, placeholder="Todos")
+                            ]),
+                            dbc.Col(md=2, children=[
+                                html.Label("Acción", className="small fw-bold text-muted"),
+                                dcc.Dropdown(id="filter-action", multi=True, placeholder="Todas")
+                            ]),
+                            dbc.Col(md=2, children=[
+                                html.Label("Sentimiento", className="small fw-bold text-muted"),
+                                dcc.RadioItems(id="filter-sentiment", inline=True, className="mt-1",
+                                               options=[{"label": " Todos", "value": "ALL"}, {"label": " Pos", "value": "Positive"}, {"label": " Neg", "value": "Negative"}], 
+                                               value="ALL", inputStyle={"marginLeft": "10px"})
+                            ]),
                         ]),
-                        dbc.Col(md=2, children=[
-                            html.Label("Plataforma", className="small fw-bold text-muted"),
-                            dcc.Dropdown(id="filter-source", multi=True, placeholder="Todas")
-                        ]),
-                        dbc.Col(md=2, children=[
-                            html.Label("Empresa", className="small fw-bold text-muted"),
-                            dcc.Dropdown(id="filter-company", multi=True, placeholder="Todas")
-                        ]),
-                        dbc.Col(md=2, children=[
-                            html.Label("Producto", className="small fw-bold text-muted"),
-                            dcc.Dropdown(id="filter-product", multi=True, placeholder="Todos")
-                        ]),
-                        dbc.Col(md=2, children=[
-                            html.Label("Acción", className="small fw-bold text-muted"),
-                            dcc.Dropdown(id="filter-action", multi=True, placeholder="Todas")
-                        ]),
-                        dbc.Col(md=2, children=[
-                            html.Label("Sentimiento", className="small fw-bold text-muted"),
-                            dcc.RadioItems(id="filter-sentiment", inline=True, className="mt-1",
-                                           options=[{"label": " Todos", "value": "ALL"}, {"label": " Pos", "value": "Positive"}, {"label": " Neg", "value": "Negative"}], 
-                                           value="ALL", inputStyle={"marginLeft": "10px"})
-                        ]),
-                    ])
-                ])),
+                        dbc.Row([
+                            dbc.Col(md=12, className="text-end", children=[
+                                dbc.Button("✕ Limpiar Filtros", id="btn-clear-filters", color="link", size="sm", className="text-muted p-0 mt-2")
+                            ])
+                        ])
+                    ])),
+                ]),
 
                 dbc.Tabs(
                     id="tabs-stakeholders", 
                     active_tab="tab-marketing", 
                     children=[
-                        dbc.Tab(label="Marketing", tab_id="tab-marketing", tab_style={"marginLeft": "auto"}),
+                        dbc.Tab(label="Marketing", tab_id="tab-marketing"),
                         dbc.Tab(label="Dirección General", tab_id="tab-dir-general"),
                         dbc.Tab(label="Retención y Facturación", tab_id="tab-retencion"),
                         dbc.Tab(label="Equipo de Producto / App", tab_id="tab-producto"),
@@ -165,7 +175,7 @@ app.layout = html.Div(style={"backgroundColor": COLOR_BACKGROUND, "fontFamily": 
             dbc.Card(style={"width": "500px", "borderRadius": "16px"}, className="shadow-lg border-0", children=dbc.CardBody([
                 html.Div(style={"textAlign": "center"}, children=[
                     html.H1("DashView", style={"color": COLOR_PRIMARY, "fontWeight": "900", "marginBottom": "10px"}),
-                    html.P("Importación Centralizada de Datos de Clientes", className="text-muted mb-4"),
+                    html.P("Inteligencia de Datos de Clientes", className="text-muted mb-4"),
                     dcc.Loading(type="circle", color=COLOR_PRIMARY, children=[
                         dcc.Upload(
                             id="upload-data-file", accept=".zip",
@@ -181,8 +191,21 @@ app.layout = html.Div(style={"backgroundColor": COLOR_BACKGROUND, "fontFamily": 
 ])
 
 # =============================================================================
-# 3. CALLBACKS Y RENDERS
+# 3. CALLBACKS
 # =============================================================================
+
+@app.callback(
+    Output("filter-period", "value"),
+    Output("filter-source", "value"),
+    Output("filter-company", "value"),
+    Output("filter-product", "value"),
+    Output("filter-action", "value"),
+    Output("filter-sentiment", "value"),
+    Input("btn-clear-filters", "n_clicks"),
+    prevent_initial_call=True
+)
+def clear_filters(n):
+    return [2010, 2025], None, None, None, None, "ALL"
 
 @app.callback(
     Output("welcome-overlay", "style", allow_duplicate=True),
@@ -225,7 +248,7 @@ def update_view(tab, period, sources, companies, products, actions, sentiment, p
         else: view = html.Div()
         return view, {"display": "none"}, {"display": "block"}
     except Exception as e:
-        return html.Div([dbc.Alert(f"Aviso: {str(e)}", color="warning")]), {"display": "none"}, {"display": "block"}
+        return html.Div([dbc.Alert(f"Aviso del Sistema: {str(e)}", color="warning")]), {"display": "none"}, {"display": "block"}
 
 # ---------------- RENDERS ----------------
 
@@ -250,8 +273,8 @@ def render_marketing(filters):
 
     return html.Div([
         dbc.Row([
-            dbc.Col(html.Div([html.H2(f"{kpis['total_signals']:,}", style={"color": COLOR_PRIMARY}), html.P("Señales Totales")], style=STYLE_KPI), md=6),
-            dbc.Col(html.Div([html.H2(f"{kpis['pct_activos']}%", style={"color": COLOR_PRIMARY}), html.P("Usuarios Activos")], style=STYLE_KPI), md=6),
+            dbc.Col(html.Div([html.H2(f"{kpis['total_signals']:,}", style={"color": COLOR_PRIMARY}), html.P("Señales Totales", className="text-muted small fw-bold text-uppercase")], style=STYLE_KPI), md=6),
+            dbc.Col(html.Div([html.H2(f"{kpis['pct_activos']}%", style={"color": COLOR_PRIMARY}), html.P("Usuarios Activos", className="text-muted small fw-bold text-uppercase")], style=STYLE_KPI), md=6),
         ], className="mb-4"),
         dbc.Row([
             dbc.Col(dcc.Graph(figure=fig_pie), md=6),
@@ -268,17 +291,18 @@ def render_general_direction(filters):
     df_bench = metrics_calc.get_competitive_benchmark(filters)
     df_heat = metrics_calc.get_company_product_heatmap(filters)
 
-    motivos = [html.Div(f"{row['causa_label']}: {row['pct']}%", className="small") for _, row in kpis["distribucion"].iterrows()] if not kpis["distribucion"].empty else ["Sin registros"]
+    fig_churn = px.pie(kpis["distribucion"], values='cantidad', names='causa_label', hole=0.4, title="Motivos de Salida (Churn)")
+    fig_churn = apply_corporate_layout(fig_churn)
 
     fig_bench = px.bar(df_bench, x='avg_sentiment', y='company', orientation='h', title="Benchmark de Sentimiento por Empresa")
     fig_bench = apply_corporate_layout(fig_bench, margin=dict(l=150), hide_x_title=True, hide_y_title=True)
 
-    # REFINAMIENTO: Matriz Profesional con go.Heatmap
     if not df_heat.empty:
         pivot = df_heat.pivot(index='company', columns='product_service', values='avg_sentiment')
         fig_heat = go.Figure(data=go.Heatmap(
             z=pivot.values, x=pivot.columns, y=pivot.index,
-            colorscale='Blues_r', colorbar=dict(title="Sentimiento")
+            colorscale=[[0, "#EF4444"], [0.5, "#FFFFFF"], [1, "#22C55E"]],
+            zmid=0, colorbar=dict(title="Score")
         ))
         fig_heat.update_layout(title="Matriz de Riesgo: Empresa vs Producto", font=dict(family=FONT_FAMILY))
     else:
@@ -288,8 +312,8 @@ def render_general_direction(filters):
 
     return html.Div([
         dbc.Row([
-            dbc.Col(html.Div([html.H2(f"{kpis['total_churn']:,}", style={"color": COLOR_PRIMARY}), html.P("Total Churn")], style=STYLE_KPI), md=6),
-            dbc.Col(html.Div([html.H5("Motivos de Salida"), html.Div(motivos, className="text-muted")], style=STYLE_KPI), md=6),
+            dbc.Col(html.Div([html.H2(f"{kpis['total_churn']:,}", style={"color": COLOR_PRIMARY}), html.P("Total Churn", className="text-muted small fw-bold text-uppercase")], style=STYLE_KPI), md=4),
+            dbc.Col(dcc.Graph(figure=fig_churn), md=8),
         ], className="mb-4"),
         dbc.Row([
             dbc.Col(dcc.Graph(figure=fig_bench), md=6),
@@ -313,13 +337,13 @@ def render_retention(filters):
     fig_topics.update_traces(marker_color=COLOR_ACCENT)
     fig_topics = apply_corporate_layout(fig_topics, margin=dict(l=180), hide_x_title=True, hide_y_title=True)
 
-    fig_map = px.bar(df_map, x='estado', y='quejas', title="Volumen de Quejas por Estado")
+    fig_map = px.bar(df_map, x='estado', y='quejas', title="Volumen de Quejas por Región")
     fig_map = apply_corporate_layout(fig_map, hide_x_title=True, hide_y_title=True)
 
     return html.Div([
         dbc.Row([
-            dbc.Col(html.Div([html.H2(f"{esc_rate}%", style={"color": COLOR_PRIMARY}), html.P("Tasa de Escalada")], style=STYLE_KPI), md=6),
-            dbc.Col(html.Div([html.H2(f"{avg_cycle} días", style={"color": COLOR_PRIMARY}), html.P("Ciclo de Retención Promedio")], style=STYLE_KPI), md=6),
+            dbc.Col(html.Div([html.H2(f"{esc_rate}%", style={"color": COLOR_PRIMARY}), html.P("Tasa de Escalada", className="text-muted small fw-bold text-uppercase")], style=STYLE_KPI), md=6),
+            dbc.Col(html.Div([html.H2(f"{avg_cycle} días", style={"color": COLOR_PRIMARY}), html.P("Ciclo de Retención Promedio", className="text-muted small fw-bold text-uppercase"), html.P("⚠ Aproximación por producto", className="small text-muted mb-0")], style=STYLE_KPI), md=6),
         ], className="mb-4"),
         dbc.Row([
             dbc.Col(dcc.Graph(figure=fig_radar), md=6),
@@ -329,17 +353,20 @@ def render_retention(filters):
     ])
 
 def render_product_team(filters):
-    # NOTA: No envolver esto en bloques que puedan fallar silenciosamente
-    df_dev = metrics_calc.get_device_usage_comparison(filters)
-    df_nlp = metrics_calc.get_app_reviews_nlp(filters)
-    df_yoy = metrics_calc.get_yoy_volume_and_sentiment(filters)
+    # FIX: Evitar colisión de filtros globales con filtros de plataforma para App
+    device_filters = {k: v for k, v in filters.items() if k != 'sources'}
+    df_dev = metrics_calc.get_device_usage_comparison(device_filters)
+    df_nlp = metrics_calc.get_app_reviews_nlp(device_filters)
+    df_yoy = metrics_calc.get_yoy_volume_and_sentiment(device_filters)
 
-    banner = dbc.Alert("Vista exclusiva: AppStore y GooglePlay.", color="info", className="mb-4")
+    banner = dbc.Alert("Vista exclusiva: AppStore y GooglePlay.", color="info", className="mb-4 shadow-sm border-0")
 
     fig_dev = go.Figure()
     if not df_dev.empty:
         fig_dev.add_trace(go.Bar(y=df_dev['source'], x=df_dev['avg_sentiment'], name='Sentimiento', orientation='h', marker_color=COLOR_PRIMARY))
-    fig_dev.update_layout(title="iOS vs Android: Experiencia de Usuario", barmode='group')
+        if 'avg_rating' in df_dev.columns:
+            fig_dev.add_trace(go.Bar(y=df_dev['source'], x=df_dev['avg_rating'], name='Rating', orientation='h', marker_color=COLOR_ACCENT))
+    fig_dev.update_layout(title="iOS vs Android: Experiencia Comparada", barmode='group')
     fig_dev = apply_corporate_layout(fig_dev, margin=dict(l=120), hide_x_title=True, hide_y_title=True)
 
     fig_nlp = px.bar(df_nlp, x='Frecuencia', y='Problema', orientation='h', title="Problemas Técnicos Críticos")
