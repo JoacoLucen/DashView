@@ -4,6 +4,9 @@ import pandas as pd
 import functools
 
 class DatabaseManager:
+    """Su objetivo principal es recibir las consultas analíticas del dashboard y aplicarles dinámicamente los filtros que el usuario selecciona en la interfaz
+    (como rango de años, empresas o sentimientos), asegurando que las respuestas sean instantáneas gracias a una estrategia inteligente de memoria caché."""
+    
     def __init__(self, db_path: str = None):
         """
         Inicializa la conexión a la base de datos SQLite.
