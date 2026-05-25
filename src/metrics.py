@@ -12,16 +12,11 @@ except ImportError:
 # =========================================================================
 
 def get_nps_proxy(filters: dict) -> dict:
-    """NPS Proxy: Promotores (advocating/review positivo) vs Detractores (churn/queja)."""
+    """NPS Proxy basado en etiquetas de sentimiento para mayor consistencia analítica."""
     query = """
         SELECT
-            SUM(CASE WHEN customer_action IN (
-                'advocating','positive_review','sharing_positive_experience'
-            ) THEN 1 ELSE 0 END) as promoters,
-            SUM(CASE WHEN customer_action IN (
-                'churning','churning_due_to_price','churning_due_to_policy',
-                'formal_complaint','complaining','venting'
-            ) THEN 1 ELSE 0 END) as detractors,
+            SUM(CASE WHEN sentiment_label = 'positive' THEN 1 ELSE 0 END) as promoters,
+            SUM(CASE WHEN sentiment_label = 'negative' THEN 1 ELSE 0 END) as detractors,
             COUNT(*) as total
         FROM client_signals
     """
@@ -134,8 +129,7 @@ def get_general_direction_kpis(filters: dict) -> dict:
         df["causa_label"] = df["customer_action"].map(mapeo_causas).fillna(df["customer_action"])
         df["pct"] = (df["cantidad"] / total_churn * 100).round(1) if total_churn > 0 else 0
     else:
-        df["causa_label"] = pd.Series(dtype=str)
-        df["pct"] = pd.Series(dtype=float)
+        df = pd.DataFrame(columns=["customer_action", "cantidad", "causa_label", "pct"])
 
     return {"total_churn": total_churn, "distribucion": df}
 
@@ -227,15 +221,16 @@ def get_escalation_rate(filters: dict) -> float:
 
 
 def get_average_behavior_cycle(filters: dict) -> float:
+    """Calcula días promedio entre primer señal negativa y churn por empresa (proxy de cliente)."""
     query = """
         SELECT AVG(JULIANDAY(date_churn) - JULIANDAY(date_neg)) as avg_days
         FROM (
             SELECT
-                source,
+                company,
                 MIN(CASE WHEN sentiment_label='negative' THEN date END) as date_neg,
                 MAX(CASE WHEN customer_action LIKE 'churning%' THEN date END) as date_churn
             FROM client_signals
-            GROUP BY source
+            GROUP BY company
         )
         WHERE date_churn IS NOT NULL AND date_neg IS NOT NULL AND date_churn > date_neg
     """
@@ -262,6 +257,8 @@ def get_product_risk_radar(filters: dict) -> pd.DataFrame:
         df["score"] = (df["neg_ratio"] * 40) + (df["churn_ratio"] * 40) + (df["norm_vol"] * 20)
         df["score"] = df["score"].round(1).clip(0, 100)
         df = df.sort_values(by="score", ascending=False).head(10)
+    else:
+        df = pd.DataFrame(columns=["product", "score", "neg_ratio", "churn_ratio", "vol", "norm_vol"])
     return df[["product", "score"]]
 
 
@@ -310,7 +307,7 @@ def get_state_intensity_map(filters: dict) -> pd.DataFrame:
         FROM client_signals
         WHERE customer_action IN ('complaining', 'formal_complaint')
         AND country IS NOT NULL
-        GROUP BY country
+        GROUP BY estado
         ORDER BY quejas DESC
         LIMIT 20
     """
@@ -332,18 +329,19 @@ def get_device_usage_comparison(filters: dict) -> pd.DataFrame:
     except Exception:
         pass
 
+    # LIKE flexible para asegurar que capta GooglePlay y AppStore sin importar espacios
     if has_rating:
         query = """
             SELECT source, AVG(rating) as avg_rating, AVG(sentiment_score) as avg_sentiment
             FROM client_signals
-            WHERE REPLACE(LOWER(source), ' ', '') IN ('appstore', 'googleplay')
+            WHERE LOWER(source) LIKE '%appstore%' OR LOWER(source) LIKE '%google%play%'
             GROUP BY source
         """
     else:
         query = """
             SELECT source, AVG(sentiment_score) as avg_sentiment
             FROM client_signals
-            WHERE REPLACE(LOWER(source), ' ', '') IN ('appstore', 'googleplay')
+            WHERE LOWER(source) LIKE '%appstore%' OR LOWER(source) LIKE '%google%play%'
             GROUP BY source
         """
     return _execute_query(query, filters)
@@ -356,7 +354,7 @@ def get_rating_distribution(filters: dict) -> pd.DataFrame:
             CAST(ROUND(rating) AS INTEGER) as estrellas,
             COUNT(*) as cantidad
         FROM client_signals
-        WHERE REPLACE(LOWER(source), ' ', '') IN ('appstore', 'googleplay')
+        WHERE (LOWER(source) LIKE '%appstore%' OR LOWER(source) LIKE '%google%play%')
         AND rating IS NOT NULL AND rating > 0
         GROUP BY CAST(ROUND(rating) AS INTEGER)
         ORDER BY estrellas
@@ -367,6 +365,8 @@ def get_rating_distribution(filters: dict) -> pd.DataFrame:
         df = all_stars.merge(df, on="estrellas", how="left").fillna(0)
         df["cantidad"] = df["cantidad"].astype(int)
         df["estrella_label"] = df["estrellas"].astype(str) + " ★"
+    else:
+        df = pd.DataFrame(columns=["estrellas", "cantidad", "estrella_label"])
     return df
 
 
@@ -374,7 +374,7 @@ def get_app_reviews_nlp(filters: dict) -> pd.DataFrame:
     query = """
         SELECT text FROM client_signals
         WHERE sentiment_label = 'negative'
-        AND REPLACE(LOWER(source), ' ', '') IN ('appstore', 'googleplay')
+        AND (LOWER(source) LIKE '%appstore%' OR LOWER(source) LIKE '%google%play%')
         LIMIT 20000
     """
     df = _execute_query(query, filters)
@@ -397,7 +397,7 @@ def get_yoy_volume_and_sentiment(filters: dict) -> pd.DataFrame:
             COUNT(*) as volumen,
             AVG(sentiment_score) as avg_sentiment
         FROM client_signals
-        WHERE REPLACE(LOWER(source), ' ', '') IN ('appstore', 'googleplay')
+        WHERE LOWER(source) LIKE '%appstore%' OR LOWER(source) LIKE '%google%play%'
         GROUP BY year
         ORDER BY year ASC
     """

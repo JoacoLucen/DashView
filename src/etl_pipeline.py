@@ -78,6 +78,9 @@ def _transform_and_clean(df: pl.DataFrame) -> pl.DataFrame:
     df = df.select(REQUIRED_COLUMNS)
 
     df = df.with_columns([
+        pl.col("source").str.strip_chars(),
+        pl.col("company").str.strip_chars(),
+        pl.col("product_service").str.strip_chars(),
         pl.col("sentiment_score").cast(pl.Float64, strict=False).fill_null(0.0),
         pl.col("year").cast(pl.Int32, strict=False),
         pl.col("month").cast(pl.Int32, strict=False),

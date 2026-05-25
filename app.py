@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import base64
 import threading
 import zipfile
@@ -52,6 +53,31 @@ _OVERLAY_VISIBLE = {
     "zIndex": 9999, "display": "flex",
     "alignItems": "center", "justifyContent": "center",
 }
+
+
+def get_data_with_fallback(metric_func, filters, title_base):
+    """Fetch data with filters. If empty, return an empty/zero result without falling back to global totals."""
+    data = metric_func(filters)
+    empty = False
+
+    if isinstance(data, pd.DataFrame):
+        empty = data.empty
+    elif isinstance(data, dict):
+        if "total_signals" in data:
+            empty = data["total_signals"] == 0
+        elif "distribucion" in data:
+            empty = data["distribucion"].empty
+        else:
+            empty = not bool(data)
+    elif isinstance(data, (int, float)):
+        empty = data == 0
+
+    title = title_base
+    if empty:
+        title = f"{title_base} (Sin datos para la selección)"
+
+    return data, title
+
 
 _KPI_BASE = {
     "backgroundColor": COLOR_BACKGROUND,
@@ -277,7 +303,7 @@ app.layout = html.Div(
                         dbc.Button(
                             [
                                 html.I(className="bi bi-layers me-2"),
-                                html.Span(id="datasets-badge-text", children="Datasets"),
+                                html.Span(id="datasets-badge-text", children="Gestión de Dataset's"),
                             ],
                             id="btn-manage-datasets",
                             color="light", size="sm", className="ms-2",
@@ -321,9 +347,9 @@ app.layout = html.Div(
                                         dbc.Col(md=2, children=[
                                             html.Label([html.I(className="bi bi-calendar3 me-1"), "Período"], style=STYLE_FILTER_LABEL),
                                             dcc.RangeSlider(
-                                                id="filter-period", min=2010, max=2025, step=1,
-                                                value=[2010, 2025],
-                                                marks={str(y): {"label": str(y), "style": {"fontSize": "10px"}} for y in range(2010, 2026, 3)},
+                                                id="filter-period", min=2010, max=2027, step=1,
+                                                value=[2010, 2027],
+                                                marks={str(y): {"label": str(y), "style": {"fontSize": "10px"}} for y in range(2010, 2028, 2)},
                                             ),
                                         ]),
                                         dbc.Col(md=2, children=[
@@ -568,12 +594,14 @@ def populate_filters(proc):
     if not os.path.exists(TARGET_DB_PATH) or proc.get("status") == "processing":
         return [], [], [], []
     try:
-        s = _execute_query("SELECT DISTINCT source FROM client_signals ORDER BY source")["source"].tolist()
-        c = _execute_query("SELECT DISTINCT company FROM client_signals ORDER BY company")["company"].tolist()
-        p = _execute_query("SELECT DISTINCT product_service FROM client_signals ORDER BY product_service")["product_service"].tolist()
-        a = _execute_query("SELECT DISTINCT customer_action FROM client_signals ORDER BY customer_action")["customer_action"].tolist()
-        return s, c, p, a
-    except Exception:
+        with sqlite3.connect(TARGET_DB_PATH) as conn:
+            s = pd.read_sql_query("SELECT DISTINCT source FROM client_signals WHERE source IS NOT NULL ORDER BY source", conn)["source"].tolist()
+            c = pd.read_sql_query("SELECT DISTINCT company FROM client_signals WHERE company IS NOT NULL ORDER BY company", conn)["company"].tolist()
+            p = pd.read_sql_query("SELECT DISTINCT product_service FROM client_signals WHERE product_service IS NOT NULL ORDER BY product_service", conn)["product_service"].tolist()
+            a = pd.read_sql_query("SELECT DISTINCT customer_action FROM client_signals WHERE customer_action IS NOT NULL ORDER BY customer_action", conn)["customer_action"].tolist()
+            return s, c, p, a
+    except Exception as e:
+        print(f"[Populate Filters Error] {e}")
         return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
 
@@ -606,7 +634,7 @@ def render_datasets_modal_body(is_open, refresh):
 )
 def update_datasets_badge(refresh, proc_status):
     count = len(get_datasets())
-    return f"Datasets ({count})" if count else "Datasets"
+    return f"Gestión de Dataset's ({count})" if count else "Gestión de Dataset's"
 
 
 @app.callback(
@@ -774,11 +802,11 @@ def check_processing(n, curr):
 # =============================================================================
 
 def render_marketing(filters: dict) -> html.Div:
-    nps       = get_nps_proxy(filters)
-    df_vel    = get_complaint_velocity(filters)
-    df_sent   = get_sentiment_by_channel(filters)
-    df_peaks  = get_monthly_activity_peaks(filters)
-    df_impact = get_source_impact(filters)
+    nps, nps_title = get_data_with_fallback(get_nps_proxy, filters, "Promotores · Pasivos · Detractores")
+    df_vel, vel_title = get_data_with_fallback(get_complaint_velocity, filters, "Tendencia Trimestral de Quejas y Deserciones")
+    df_sent, sent_title = get_data_with_fallback(get_sentiment_by_channel, filters, "Índice de Satisfacción por Canal")
+    df_peaks, peaks_title = get_data_with_fallback(get_monthly_activity_peaks, filters, "Volumen de Señales por Mes")
+    df_impact, impact_title = get_data_with_fallback(get_source_impact, filters, "Satisfacción vs Insatisfacción por Plataforma (%)")
 
     # NPS breakdown stacked bar — show % on bars, x-axis in %
     fig_nps = go.Figure()
@@ -802,7 +830,7 @@ def render_marketing(filters: dict) -> html.Div:
                 hovertemplate=f"<b>{row['Segmento']}</b><br>Clientes: {row['Cantidad']:,}<br>Proporción: {pct}%<extra></extra>",
             ))
     fig_nps.update_layout(
-        title="Promotores · Pasivos · Detractores",
+        title=nps_title,
         barmode="stack",
         xaxis=dict(range=[0, 100], ticksuffix="%"),
     )
@@ -819,13 +847,13 @@ def render_marketing(filters: dict) -> html.Div:
             fill="tozeroy", fillcolor="rgba(197,90,17,0.08)",
             hovertemplate="<b>%{x}</b><br>Quejas + Deserciones: %{y:,}<extra></extra>",
         ))
-    fig_vel.update_layout(title="Tendencia Trimestral de Quejas y Deserciones")
+    fig_vel.update_layout(title=vel_title)
     fig_vel = apply_corporate_layout(fig_vel, hide_x_title=True, hide_y_title=True)
     fig_vel.update_xaxes(tickangle=-45, nticks=12)
 
     fig_sent = px.bar(
         df_sent, x="avg_sentiment", y="source", orientation="h",
-        title="Índice de Satisfacción por Canal",
+        title=sent_title,
         labels={"avg_sentiment": "Índice de Satisfacción", "source": "Canal"},
     )
     fig_sent.update_traces(
@@ -835,7 +863,7 @@ def render_marketing(filters: dict) -> html.Div:
 
     fig_peaks = px.bar(
         df_peaks, x="mes_label", y="volumen",
-        title="Volumen de Señales por Mes",
+        title=peaks_title,
         labels={"mes_label": "Mes", "volumen": "Señales"},
     )
     fig_peaks.update_traces(
@@ -846,7 +874,7 @@ def render_marketing(filters: dict) -> html.Div:
 
     fig_impact = px.bar(
         df_impact, x="source", y=["pct_positive", "pct_negative"],
-        title="Satisfacción vs Insatisfacción por Plataforma (%)",
+        title=impact_title,
         labels={
             "source": "Plataforma", "value": "Porcentaje",
             "pct_positive": "% Satisfechos", "pct_negative": "% Insatisfechos",
@@ -895,24 +923,24 @@ def render_marketing(filters: dict) -> html.Div:
 
 
 def render_general_direction(filters: dict) -> html.Div:
-    kpis     = get_general_direction_kpis(filters)
-    reg      = get_regulatory_exposure(filters)
-    df_pre   = get_prechurn_signals_trend(filters)
-    df_bench = get_competitive_benchmark(filters)
-    df_heat  = get_company_product_heatmap(filters)
+    kpis, churn_title = get_data_with_fallback(get_general_direction_kpis, filters, "¿Por qué se van los clientes?")
+    reg, _            = get_data_with_fallback(get_regulatory_exposure, filters, "Exposición Regulatoria")
+    df_pre, pre_title = get_data_with_fallback(get_prechurn_signals_trend, filters, "Señales de Alerta Temprana por Año")
+    df_bench, bench_title = get_data_with_fallback(get_competitive_benchmark, filters, "Empresas con Menor Satisfacción de Clientes")
+    df_heat, heat_title   = get_data_with_fallback(get_company_product_heatmap, filters, "¿Qué empresa-producto tiene clientes más insatisfechos?")
 
     dist_df = kpis["distribucion"]
     if not dist_df.empty and "causa_label" in dist_df.columns:
         fig_churn = px.pie(
             dist_df, values="cantidad", names="causa_label", hole=0.5,
-            title="¿Por qué se van los clientes?",
+            title=churn_title,
             labels={"causa_label": "Motivo de Salida", "cantidad": "Clientes Afectados"},
         )
         fig_churn.update_traces(
             hovertemplate="<b>%{label}</b><br>Clientes: %{value:,}<br>Del total: %{percent}<extra></extra>",
         )
     else:
-        fig_churn = go.Figure().update_layout(title="Motivos de Deserción — Sin datos suficientes")
+        fig_churn = go.Figure().update_layout(title=f"{churn_title} — Sin datos suficientes")
     fig_churn = apply_corporate_layout(fig_churn)
 
     # Pre-churn early warning trend
@@ -926,7 +954,7 @@ def render_general_direction(filters: dict) -> html.Div:
             fill="tozeroy", fillcolor="rgba(255,192,0,0.10)",
             hovertemplate="<b>%{x}</b><br>Señales Pre-Deserción: %{y:,}<extra></extra>",
         ))
-    fig_pre.update_layout(title="Señales de Alerta Temprana por Año")
+    fig_pre.update_layout(title=pre_title)
     fig_pre = apply_corporate_layout(fig_pre, hide_x_title=True, hide_y_title=True)
 
     if not df_bench.empty:
@@ -948,11 +976,11 @@ def render_general_direction(filters: dict) -> html.Div:
             hovertemplate="<b>%{y}</b><br>Satisfacción: %{x:.1f}%<extra></extra>",
         ))
         fig_bench.update_layout(
-            title="Empresas con Menor Satisfacción de Clientes",
+            title=bench_title,
             xaxis=dict(range=[0, 110], ticksuffix="%"),
         )
     else:
-        fig_bench = go.Figure().update_layout(title="Ranking Competitivo — Sin datos suficientes")
+        fig_bench = go.Figure().update_layout(title=f"{bench_title} — Sin datos suficientes")
     fig_bench = apply_corporate_layout(fig_bench, margin=dict(l=160), hide_x_title=True, hide_y_title=True)
 
     if not df_heat.empty:
@@ -981,7 +1009,7 @@ def render_general_direction(filters: dict) -> html.Div:
             hovertemplate="<b>%{y}</b><br>Producto: %{x}<br>Satisfacción: %{z:.0f}%<extra></extra>",
         ))
         fig_heat.update_layout(
-            title="¿Qué empresa-producto tiene clientes más insatisfechos?",
+            title=heat_title,
             font=dict(family=FONT_FAMILY),
             annotations=[dict(
                 text="0% = muy insatisfechos · 50% = neutro · 100% = muy satisfechos",
@@ -990,7 +1018,7 @@ def render_general_direction(filters: dict) -> html.Div:
             )],
         )
     else:
-        fig_heat = go.Figure().update_layout(title="Sin datos para la matriz")
+        fig_heat = go.Figure().update_layout(title=heat_title)
     fig_heat = apply_corporate_layout(fig_heat, margin=dict(l=160, b=130), hide_x_title=True, hide_y_title=True)
 
     reg_style = STYLE_KPI_DANGER if reg["pct"] > 50 else STYLE_KPI_WARNING
