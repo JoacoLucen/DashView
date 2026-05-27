@@ -186,7 +186,7 @@ def get_company_product_heatmap(filters: dict) -> pd.DataFrame:
         FROM client_signals
         GROUP BY company, product_service
         ORDER BY COUNT(*) DESC
-        LIMIT 150
+        LIMIT 500
     """
     df = _execute_query(query, filters)
     if not df.empty:
@@ -202,7 +202,7 @@ def get_company_product_heatmap(filters: dict) -> pd.DataFrame:
 # PESTAÑA 3: RETENCIÓN Y FACTURACIÓN
 # =========================================================================
 
-def get_escalation_rate(filters: dict) -> float:
+def get_escalation_rate(filters: dict) -> dict:
     query = """
         SELECT customer_action, COUNT(*) as cantidad
         FROM client_signals
@@ -210,14 +210,17 @@ def get_escalation_rate(filters: dict) -> float:
         GROUP BY customer_action
     """
     df = _execute_query(query, filters)
+    comp, form = 0, 0
+    rate = 0.0
     if not df.empty:
         df_idx = df.set_index('customer_action').reindex(['complaining', 'formal_complaint'], fill_value=0)
-        comp = df_idx.loc['complaining', 'cantidad']
-        form = df_idx.loc['formal_complaint', 'cantidad']
+        comp = int(df_idx.loc['complaining', 'cantidad'])
+        form = int(df_idx.loc['formal_complaint', 'cantidad'])
         total = comp + form
         if total > 0:
-            return round((float(form) / float(total)) * 100, 1)
-    return 0.0
+            rate = round((float(form) / float(total)) * 100, 1)
+    
+    return {"rate": rate, "comp": comp, "form": form}
 
 
 def get_average_behavior_cycle(filters: dict) -> float:

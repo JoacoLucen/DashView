@@ -808,7 +808,7 @@ def render_marketing(filters: dict) -> html.Div:
     df_peaks, peaks_title = get_data_with_fallback(get_monthly_activity_peaks, filters, "Volumen de Señales por Mes")
     df_impact, impact_title = get_data_with_fallback(get_source_impact, filters, "Satisfacción vs Insatisfacción por Plataforma (%)")
 
-    # NPS breakdown stacked bar — show % on bars, x-axis in %
+    # NPS breakdown stacked bar
     fig_nps = go.Figure()
     total_sig = nps["total_signals"] or 1
     if not nps["breakdown_df"].empty:
@@ -851,15 +851,23 @@ def render_marketing(filters: dict) -> html.Div:
     fig_vel = apply_corporate_layout(fig_vel, hide_x_title=True, hide_y_title=True)
     fig_vel.update_xaxes(tickangle=-45, nticks=12)
 
-    fig_sent = px.bar(
-        df_sent, x="avg_sentiment", y="source", orientation="h",
-        title=sent_title,
-        labels={"avg_sentiment": "Índice de Satisfacción", "source": "Canal"},
-    )
-    fig_sent.update_traces(
-        hovertemplate="<b>%{y}</b><br>Índice: %{x:.3f}<extra></extra>",
-    )
-    fig_sent = apply_corporate_layout(fig_sent, margin=dict(l=150), hide_x_title=True, hide_y_title=True)
+    # Sentiment by channel with conditional coloring
+    if not df_sent.empty:
+        bar_colors = [
+            COLOR_DANGER if v < 0 else (COLOR_WARNING if v < 0.1 else COLOR_SUCCESS)
+            for v in df_sent["avg_sentiment"]
+        ]
+        fig_sent = go.Figure(go.Bar(
+            x=df_sent["avg_sentiment"], y=df_sent["source"],
+            orientation="h",
+            marker_color=bar_colors,
+            hovertemplate="<b>%{y}</b><br>Índice: %{x:.3f}<extra></extra>",
+        ))
+        fig_sent.add_vline(x=0, line_dash="dash", line_color=COLOR_NEUTRAL_2, line_width=1)
+        fig_sent.update_layout(title=sent_title, xaxis_title="Índice de Satisfacción")
+    else:
+        fig_sent = go.Figure().update_layout(title=sent_title)
+    fig_sent = apply_corporate_layout(fig_sent, margin=dict(l=150), hide_y_title=True)
 
     fig_peaks = px.bar(
         df_peaks, x="mes_label", y="volumen",
@@ -881,22 +889,37 @@ def render_marketing(filters: dict) -> html.Div:
         },
         barmode="group",
     )
+    fig_impact.update_traces(
+        hovertemplate="<b>%{x}</b><br>%{data.name}: %{y:.1f}%<extra></extra>",
+    )
     fig_impact = apply_corporate_layout(fig_impact, barmode="group", hide_x_title=True, hide_y_title=True)
 
     nps_score = nps["nps_score"]
     nps_style = STYLE_KPI_SUCCESS if nps_score >= 0 else STYLE_KPI_DANGER
 
+    warnings = []
+    if filters.get("sentiment") and filters["sentiment"] != "ALL":
+        warnings.append(dbc.Alert(
+            "⚠ El filtro de Sentimiento afecta el cálculo del NPS. Para ver el NPS real, usar 'Todos'.",
+            color="warning", className="mb-3 py-2 small"
+        ))
+    
+    action_note = ""
+    if filters.get("actions"):
+        action_note = "Esta métrica no cambia con el filtro de Acción del Cliente. Se basa en la etiqueta de sentimiento."
+
     return html.Div([
+        html.Div(warnings),
         dbc.Row([
             dbc.Col(kpi_card(
                 f"{nps['total_signals']:,}", "Total Señales de Clientes",
                 subtitle="Interacciones registradas en todos los canales digitales",
             ), md=3),
-            dbc.Col(kpi_card(
+            dbc.Col(html.Div(id="kpi-nps-proxy", children=kpi_card(
                 f"{nps_score:+.0f}", "NPS Proxy",
                 nps_style,
-                subtitle="Promotores menos Detractores — rango de −100 a +100",
-            ), md=3),
+                subtitle=action_note if action_note else "Promotores menos Detractores — rango de −100 a +100",
+            )), md=3),
             dbc.Col(kpi_card(
                 f"{nps['pct_promoters']}%", "Promotores",
                 STYLE_KPI_SUCCESS,
@@ -913,7 +936,13 @@ def render_marketing(filters: dict) -> html.Div:
             dbc.Col(_G(fig_nps), md=4),
         ], className="mb-4 g-3"),
         dbc.Row([
-            dbc.Col(_G(fig_sent),   md=6),
+            dbc.Col(html.Div([
+                _G(fig_sent),
+                html.P(
+                    "El Índice de Satisfacción se basa en sentiment_score. El filtro de Acción reduce el universo de registros pero no cambia la definición de la métrica.",
+                    style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"}
+                )
+            ]), md=6),
             dbc.Col(_G(fig_impact), md=6),
         ], className="mb-4 g-3"),
         dbc.Row([
@@ -1024,7 +1053,17 @@ def render_general_direction(filters: dict) -> html.Div:
     reg_style = STYLE_KPI_DANGER if reg["pct"] > 50 else STYLE_KPI_WARNING
     prechurn_total = int(df_pre["prechurn"].sum()) if not df_pre.empty else 0
 
+    warnings = []
+    if filters.get("sentiment") and filters["sentiment"] != "ALL":
+        warnings.append(dbc.Alert(
+            f"Mostrando datos para registros con sentimiento: {filters['sentiment']}. Esto puede sesgar los indicadores de churn y satisfacción.",
+            color="warning", className="mb-3 py-2 small"
+        ))
+
+    reg_note = "Esta métrica no cambia con el filtro de Acción o Sentimiento. El porcentaje varía según la empresa seleccionada."
+
     return html.Div([
+        html.Div(warnings),
         dbc.Row([
             dbc.Col(kpi_card(
                 f"{kpis['total_churn']:,}", "Señales de Deserción", STYLE_KPI_DANGER,
@@ -1032,7 +1071,7 @@ def render_general_direction(filters: dict) -> html.Div:
             ), md=4),
             dbc.Col(kpi_card(
                 f"{reg['pct']}%", "Exposición Regulatoria (CFPB)", reg_style,
-                subtitle=f"{reg['regulatorias']:,} quejas regulatorias de {reg['total']:,} señales totales",
+                subtitle=reg_note if filters.get("company") or filters.get("actions") or filters.get("sentiment") != "ALL" else f"{reg['regulatorias']:,} quejas regulatorias de {reg['total']:,} señales totales",
             ), md=4),
             dbc.Col(kpi_card(
                 f"{prechurn_total:,}", "Señales Pre-Deserción", STYLE_KPI_WARNING,
@@ -1044,8 +1083,16 @@ def render_general_direction(filters: dict) -> html.Div:
             dbc.Col(_G(fig_pre),   md=7),
         ], className="mb-4 g-3"),
         dbc.Row([
-            dbc.Col(_G(fig_bench), md=6),
-            dbc.Col(_G(fig_heat),  md=6),
+            dbc.Col(html.Div([
+                _G(fig_bench),
+                html.P("El Índice de Satisfacción se basa en sentiment_score. El filtro de Acción reduce el volumen pero no cambia la definición de la métrica.",
+                       style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"})
+            ]), md=6),
+            dbc.Col(html.Div([
+                _G(fig_heat),
+                html.P("El heatmap agrupa por promedio de sentimiento. El filtro de Acción reduce el volumen disponible.",
+                       style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"})
+            ]), md=6),
         ], className="g-3"),
     ])
 
