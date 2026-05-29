@@ -202,7 +202,7 @@ def get_company_product_heatmap(filters: dict) -> pd.DataFrame:
 # PESTAÑA 3: RETENCIÓN Y FACTURACIÓN
 # =========================================================================
 
-def get_escalation_rate(filters: dict) -> dict:
+def get_escalation_rate(filters: dict) -> float:
     query = """
         SELECT customer_action, COUNT(*) as cantidad
         FROM client_signals
@@ -210,34 +210,49 @@ def get_escalation_rate(filters: dict) -> dict:
         GROUP BY customer_action
     """
     df = _execute_query(query, filters)
-    comp, form = 0, 0
-    rate = 0.0
     if not df.empty:
-        df_idx = df.set_index('customer_action').reindex(['complaining', 'formal_complaint'], fill_value=0)
-        comp = int(df_idx.loc['complaining', 'cantidad'])
-        form = int(df_idx.loc['formal_complaint', 'cantidad'])
+        df_idx = df.set_index('customer_action').reindex(
+            ['complaining', 'formal_complaint'], fill_value=0
+        )
+        comp = df_idx.loc['complaining', 'cantidad']
+        form = df_idx.loc['formal_complaint', 'cantidad']
         total = comp + form
         if total > 0:
-            rate = round((float(form) / float(total)) * 100, 1)
-    
-    return {"rate": rate, "comp": comp, "form": form}
+            return round((float(form) / float(total)) * 100, 1)
+    return 0.0
 
 
 def get_average_behavior_cycle(filters: dict) -> float:
-    """Calcula días promedio entre primer señal negativa y churn por empresa (proxy de cliente)."""
-    query = """
-        SELECT AVG(JULIANDAY(date_churn) - JULIANDAY(date_neg)) as avg_days
-        FROM (
-            SELECT
-                company,
-                MIN(CASE WHEN sentiment_label='negative' THEN date END) as date_neg,
-                MAX(CASE WHEN customer_action LIKE 'churning%' THEN date END) as date_churn
-            FROM client_signals
-            GROUP BY company
-        )
-        WHERE date_churn IS NOT NULL AND date_neg IS NOT NULL AND date_churn > date_neg
+    # Los filtros deben aplicarse en la subconsulta interna.
+    # Construir manualmente con _build_dynamic_query sobre la query interna.
+    inner_query = """
+        SELECT
+            company,
+            MIN(CASE WHEN sentiment_label = 'negative' THEN date END) as date_neg,
+            MAX(CASE WHEN customer_action LIKE 'churning%' THEN date END) as date_churn
+        FROM client_signals
+        GROUP BY company
     """
-    df = _execute_query(query, filters)
+    # Aplicar filtros a la query interna antes de envolver en la externa
+    from src.database_manager import _build_dynamic_query, DB_PATH
+    inner_with_filters, params = _build_dynamic_query(inner_query, filters)
+
+    outer_query = f"""
+        SELECT AVG(JULIANDAY(date_churn) - JULIANDAY(date_neg)) as avg_days
+        FROM ({inner_with_filters})
+        WHERE date_churn IS NOT NULL
+          AND date_neg IS NOT NULL
+          AND date_churn > date_neg
+    """
+    import sqlite3
+    import pandas as pd
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            df = pd.read_sql_query(outer_query, conn, params=params)
+    except Exception as e:
+        return 0.0
+
     if not df.empty and pd.notna(df["avg_days"].iloc[0]):
         return round(float(df["avg_days"].iloc[0]), 1)
     return 0.0

@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
 
-from src.database_manager import _execute_query, clear_cache
+from src.database_manager import _execute_query, clear_cache, get_filter_options
 from src.metrics import (
     get_nps_proxy, get_complaint_velocity,
     get_sentiment_by_channel, get_monthly_activity_peaks, get_source_impact,
@@ -133,6 +133,56 @@ def kpi_card(value: str, label: str, style: dict = None, subtitle: str = None) -
     return html.Div(children, style=style or STYLE_KPI, className="kpi-hover")
 
 
+def empty_state(title: str) -> dbc.Card:
+    """
+    Componente visual para mostrar cuando una métrica no tiene datos
+    para los filtros activos. Reemplaza a gráficos o KPIs vacíos.
+    """
+    return dbc.Card(
+        dbc.CardBody([
+            html.Div([
+                html.I(
+                    className="bi bi-funnel",
+                    style={
+                        "fontSize": "2rem",
+                        "color": COLOR_NEUTRAL_2,
+                        "marginBottom": "10px",
+                        "display": "block",
+                    }
+                ),
+                html.Div(
+                    title,
+                    style={
+                        "fontWeight": "600",
+                        "fontSize": "0.85rem",
+                        "color": COLOR_NEUTRAL_DARK,
+                        "marginBottom": "6px",
+                    }
+                ),
+                html.Div(
+                    "No se encontraron datos para la combinación de filtros seleccionada. "
+                    "Probá ampliando el rango de fechas, cambiando el canal o reduciendo los filtros activos.",
+                    style={
+                        "fontSize": "0.78rem",
+                        "color": COLOR_NEUTRAL_2,
+                        "lineHeight": "1.5",
+                    }
+                ),
+            ], style={"textAlign": "center", "padding": "24px 16px"}),
+        ]),
+        style={
+            "border": f"1.5px dashed {COLOR_BORDER}",
+            "borderRadius": "14px",
+            "backgroundColor": "rgba(0,0,0,0.01)",
+            "height": "100%",
+            "minHeight": "160px",
+            "display": "flex",
+            "alignItems": "center",
+        },
+        className="shadow-none",
+    )
+
+
 def apply_corporate_layout(fig, barmode=None, margin=None, hide_x_title=False, hide_y_title=False):
     default_margin = dict(l=120, r=40, t=52, b=72)
     if margin:
@@ -232,6 +282,7 @@ app.layout = html.Div(
     children=[
         dcc.Store(id="processing-status", data={"status": "ready"}),
         dcc.Store(id="dataset-refresh", data=0),
+        dcc.Store(id="available-years-list", data=list(range(2010, 2028))),
         dcc.Interval(id="status-interval", interval=1000, n_intervals=0),
 
         # ── DATASET MANAGEMENT MODAL ───────────────────────────────────────
@@ -346,11 +397,28 @@ app.layout = html.Div(
                                     dbc.Row([
                                         dbc.Col(md=2, children=[
                                             html.Label([html.I(className="bi bi-calendar3 me-1"), "Período"], style=STYLE_FILTER_LABEL),
-                                            dcc.RangeSlider(
-                                                id="filter-period", min=2010, max=2027, step=1,
-                                                value=[2010, 2027],
-                                                marks={str(y): {"label": str(y), "style": {"fontSize": "10px"}} for y in range(2010, 2028, 2)},
-                                            ),
+                                            html.Div([
+                                                dcc.Dropdown(
+                                                    id="filter-year-from",
+                                                    options=[{"label": str(y), "value": y} for y in range(2010, 2028)],
+                                                    value=2010,
+                                                    clearable=False,
+                                                    style={"fontSize": "13px", "width": "90px"},
+                                                ),
+                                                html.Span("—", style={
+                                                    "padding": "0 6px",
+                                                    "color": COLOR_NEUTRAL_2,
+                                                    "lineHeight": "36px",
+                                                    "fontSize": "14px",
+                                                }),
+                                                dcc.Dropdown(
+                                                    id="filter-year-to",
+                                                    options=[{"label": str(y), "value": y} for y in range(2010, 2028)],
+                                                    value=2027,
+                                                    clearable=False,
+                                                    style={"fontSize": "13px", "width": "90px"},
+                                                ),
+                                            ], style={"display": "flex", "alignItems": "center"}),
                                         ]),
                                         dbc.Col(md=2, children=[
                                             html.Label([html.I(className="bi bi-broadcast me-1"), "Plataforma"], style=STYLE_FILTER_LABEL),
@@ -518,17 +586,39 @@ app.layout = html.Div(
 # =============================================================================
 
 @app.callback(
-    Output("filter-period", "value"),
+    Output("filter-year-to", "options"),
+    Output("filter-year-from", "options"),
+    Input("filter-year-from", "value"),
+    Input("filter-year-to", "value"),
+    Input("available-years-list", "data"),
+)
+def sync_year_dropdowns(year_from, year_to, available_years):
+    if not available_years:
+        available_years = list(range(2010, 2028))
+    
+    # "Hasta" solo muestra años >= año_desde
+    opts_to   = [{"label": str(y), "value": y} for y in available_years if y >= (year_from or min(available_years))]
+    # "Desde" solo muestra años <= año_hasta
+    opts_from = [{"label": str(y), "value": y} for y in available_years if y <= (year_to or max(available_years))]
+    return opts_to, opts_from
+
+
+@app.callback(
+    Output("filter-year-from", "value"),
+    Output("filter-year-to", "value"),
     Output("filter-source", "value"),
     Output("filter-company", "value"),
     Output("filter-product", "value"),
     Output("filter-action", "value"),
     Output("filter-sentiment", "value"),
     Input("btn-clear-filters", "n_clicks"),
+    State("available-years-list", "data"),
     prevent_initial_call=True,
 )
-def clear_filters(n):
-    return [2010, 2025], None, None, None, None, "ALL"
+def clear_filters(n, available_years):
+    y_min = min(available_years) if available_years else 2010
+    y_max = max(available_years) if available_years else 2027
+    return y_min, y_max, None, None, None, None, "ALL"
 
 
 @app.callback(
@@ -548,7 +638,8 @@ def show_import_overlay(n):
     Output("welcome-overlay", "style", allow_duplicate=True),
     Output("main-dashboard-container", "style", allow_duplicate=True),
     Input("tabs-stakeholders", "active_tab"),
-    Input("filter-period", "value"),
+    Input("filter-year-from", "value"),
+    Input("filter-year-to", "value"),
     Input("filter-source", "value"),
     Input("filter-company", "value"),
     Input("filter-product", "value"),
@@ -557,14 +648,14 @@ def show_import_overlay(n):
     Input("processing-status", "data"),
     prevent_initial_call='initial_duplicate',
 )
-def update_view(tab, period, sources, companies, products, actions, sentiment, proc_status):
+def update_view(tab, year_from, year_to, sources, companies, products, actions, sentiment, proc_status):
     if not os.path.exists(TARGET_DB_PATH):
         return html.Div(), dash.no_update, {"display": "none"}
     if proc_status.get("status") == "processing":
         return dash.no_update, dash.no_update, dash.no_update
 
     filters = {
-        "period": period, "sources": sources, "companies": companies,
+        "period": [year_from or 2010, year_to or 2027], "sources": sources, "companies": companies,
         "products": products, "actions": actions, "sentiment": sentiment,
     }
 
@@ -584,25 +675,85 @@ def update_view(tab, period, sources, companies, products, actions, sentiment, p
 
 
 @app.callback(
-    Output("filter-source", "options"),
+    Output("filter-source",  "options"),
     Output("filter-company", "options"),
     Output("filter-product", "options"),
-    Output("filter-action", "options"),
-    Input("processing-status", "data"),
+    Output("filter-action",  "options"),
+    Output("filter-year-from", "options"),
+    Output("filter-year-to",   "options"),
+    Input("processing-status",  "data"),
+    Input("filter-year-from",   "value"),
+    Input("filter-year-to",     "value"),
+    Input("filter-source",      "value"),
+    Input("filter-company",     "value"),
+    Input("filter-product",     "value"),
+    Input("filter-action",      "value"),
+    Input("filter-sentiment",   "value"),
 )
-def populate_filters(proc):
-    if not os.path.exists(TARGET_DB_PATH) or proc.get("status") == "processing":
-        return [], [], [], []
+def populate_filters_adaptive(
+    proc_status,
+    year_from, year_to,
+    sources, companies, products, actions, sentiment
+):
+    empty = ([], [], [], [], [], [])
+
+    if not os.path.exists(TARGET_DB_PATH):
+        return empty
+    if proc_status and proc_status.get("status") == "processing":
+        return empty
+
+    # Construir el dict de filtros activos con el mismo formato
+    # que usa _build_dynamic_query, tal como lo hace update_view()
+    active_filters = {}
+
+    if year_from is not None and year_to is not None:
+        active_filters["period"] = [int(year_from), int(year_to)]
+    elif year_from is not None:
+        active_filters["period"] = [int(year_from), 2027]
+    elif year_to is not None:
+        active_filters["period"] = [2010, int(year_to)]
+
+    if sources:
+        active_filters["sources"] = sources if isinstance(sources, list) else [sources]
+
+    if companies:
+        active_filters["companies"] = companies if isinstance(companies, list) else [companies]
+
+    if products:
+        active_filters["products"] = products if isinstance(products, list) else [products]
+
+    if actions:
+        active_filters["actions"] = actions if isinstance(actions, list) else [actions]
+
+    if sentiment and sentiment != "ALL":
+        active_filters["sentiment"] = sentiment
+
     try:
-        with sqlite3.connect(TARGET_DB_PATH) as conn:
-            s = pd.read_sql_query("SELECT DISTINCT source FROM client_signals WHERE source IS NOT NULL ORDER BY source", conn)["source"].tolist()
-            c = pd.read_sql_query("SELECT DISTINCT company FROM client_signals WHERE company IS NOT NULL ORDER BY company", conn)["company"].tolist()
-            p = pd.read_sql_query("SELECT DISTINCT product_service FROM client_signals WHERE product_service IS NOT NULL ORDER BY product_service", conn)["product_service"].tolist()
-            a = pd.read_sql_query("SELECT DISTINCT customer_action FROM client_signals WHERE customer_action IS NOT NULL ORDER BY customer_action", conn)["customer_action"].tolist()
-            return s, c, p, a
+        opts = get_filter_options(active_filters)
     except Exception as e:
-        print(f"[Populate Filters Error] {e}")
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        print(f"[populate_filters_adaptive] Error: {e}")
+        return empty
+
+    # Para year-from: mostrar todos los años disponibles,
+    # pero deshabilitar los que sean mayores al year_to seleccionado
+    year_from_opts = [
+        {**o, "disabled": (year_to is not None and o["value"] > year_to)}
+        for o in opts["years"]
+    ]
+    # Para year-to: deshabilitar los menores al year_from seleccionado
+    year_to_opts = [
+        {**o, "disabled": (year_from is not None and o["value"] < year_from)}
+        for o in opts["years"]
+    ]
+
+    return (
+        opts["sources"],
+        opts["companies"],
+        opts["products"],
+        opts["actions"],
+        year_from_opts,
+        year_to_opts,
+    )
 
 
 # ── Dataset modal ──────────────────────────────────────────────────────────────
@@ -808,37 +959,41 @@ def render_marketing(filters: dict) -> html.Div:
     df_peaks, peaks_title = get_data_with_fallback(get_monthly_activity_peaks, filters, "Volumen de Señales por Mes")
     df_impact, impact_title = get_data_with_fallback(get_source_impact, filters, "Satisfacción vs Insatisfacción por Plataforma (%)")
 
-    # NPS breakdown stacked bar
-    fig_nps = go.Figure()
-    total_sig = nps["total_signals"] or 1
-    if not nps["breakdown_df"].empty:
-        seg_colors = {
-            "Promotores": COLOR_SUCCESS,
-            "Pasivos": COLOR_NEUTRAL_2,
-            "Detractores": COLOR_DANGER,
-        }
-        for _, row in nps["breakdown_df"].iterrows():
-            pct = round(row["Cantidad"] / total_sig * 100, 1)
-            fig_nps.add_trace(go.Bar(
-                x=[pct], y=["Clientes"],
-                name=row["Segmento"],
-                orientation="h",
-                marker_color=seg_colors.get(row["Segmento"], COLOR_ACCENT),
-                text=[f"{pct:.0f}%"] if pct >= 5 else [None],
-                textposition="inside",
-                textfont=dict(color="white", size=12, family=FONT_FAMILY),
-                hovertemplate=f"<b>{row['Segmento']}</b><br>Clientes: {row['Cantidad']:,}<br>Proporción: {pct}%<extra></extra>",
-            ))
-    fig_nps.update_layout(
-        title=nps_title,
-        barmode="stack",
-        xaxis=dict(range=[0, 100], ticksuffix="%"),
-    )
-    fig_nps = apply_corporate_layout(fig_nps, barmode="stack", hide_x_title=True, hide_y_title=True)
+    # KPI 1: Total
+    total = nps["total_signals"]
+    total_str = f"{total:,}" if total > 0 else "—"
+    total_sub = "Interacciones registradas en todos los canales digitales" if total > 0 \
+                else "Sin datos para los filtros seleccionados"
+    col_total = dbc.Col(kpi_card(total_str, "Total Señales de Clientes", subtitle=total_sub), md=3)
 
-    # Complaint velocity trend
-    fig_vel = go.Figure()
-    if not df_vel.empty:
+    # KPI 2: NPS
+    nps_score = nps["nps_score"]
+    nps_str = f"{nps_score:+.0f}" if total > 0 else "—"
+    nps_style = (STYLE_KPI_SUCCESS if nps_score >= 0 else STYLE_KPI_DANGER) if total > 0 else STYLE_KPI
+    nps_sub = "Promotores menos Detractores — rango de −100 a +100"
+    if filters.get("actions"):
+        nps_sub = "Esta métrica no cambia con el filtro de Acción. Se basa en sentimiento."
+    if total == 0:
+        nps_sub = "Sin datos para los filtros seleccionados"
+    col_nps = dbc.Col(kpi_card(nps_str, "NPS Proxy", nps_style, subtitle=nps_sub), md=3)
+
+    # KPI 3: Promoters
+    prom_str = f"{nps['pct_promoters']}%" if total > 0 else "—"
+    prom_sub = "Clientes que defienden o recomiendan activamente la marca" if total > 0 \
+               else "Sin datos para los filtros seleccionados"
+    col_prom = dbc.Col(kpi_card(prom_str, "Promotores", STYLE_KPI_SUCCESS if total > 0 else STYLE_KPI, subtitle=prom_sub), md=3)
+
+    # KPI 4: Detractors
+    det_str = f"{nps['pct_detractors']}%" if total > 0 else "—"
+    det_sub = "Clientes con comportamiento de queja, deserción o malestar" if total > 0 \
+              else "Sin datos para los filtros seleccionados"
+    col_det = dbc.Col(kpi_card(det_str, "Detractores", STYLE_KPI_DANGER if total > 0 else STYLE_KPI, subtitle=det_sub), md=3)
+
+    # GRAPH 1: Quarterly Trend
+    if df_vel.empty or df_vel["quejas"].sum() == 0:
+        col_vel = dbc.Col(empty_state(vel_title), md=8)
+    else:
+        fig_vel = go.Figure()
         fig_vel.add_trace(go.Scatter(
             x=df_vel["periodo"], y=df_vel["quejas"],
             mode="lines+markers",
@@ -847,107 +1002,82 @@ def render_marketing(filters: dict) -> html.Div:
             fill="tozeroy", fillcolor="rgba(197,90,17,0.08)",
             hovertemplate="<b>%{x}</b><br>Quejas + Deserciones: %{y:,}<extra></extra>",
         ))
-    fig_vel.update_layout(title=vel_title)
-    fig_vel = apply_corporate_layout(fig_vel, hide_x_title=True, hide_y_title=True)
-    fig_vel.update_xaxes(tickangle=-45, nticks=12)
+        fig_vel.update_layout(title=vel_title)
+        fig_vel = apply_corporate_layout(fig_vel, hide_x_title=True, hide_y_title=True)
+        fig_vel.update_xaxes(tickangle=-45, nticks=12)
+        col_vel = dbc.Col(_G(fig_vel), md=8)
 
-    # Sentiment by channel with conditional coloring
-    if not df_sent.empty:
-        bar_colors = [
-            COLOR_DANGER if v < 0 else (COLOR_WARNING if v < 0.1 else COLOR_SUCCESS)
-            for v in df_sent["avg_sentiment"]
-        ]
+    # GRAPH 2: NPS Breakdown
+    if total == 0 or nps["breakdown_df"].empty:
+        col_nps_graph = dbc.Col(empty_state(nps_title), md=4)
+    else:
+        fig_nps = go.Figure()
+        total_sig = total or 1
+        seg_colors = {"Promotores": COLOR_SUCCESS, "Pasivos": COLOR_NEUTRAL_2, "Detractores": COLOR_DANGER}
+        for _, row in nps["breakdown_df"].iterrows():
+            pct = round(row["Cantidad"] / total_sig * 100, 1)
+            fig_nps.add_trace(go.Bar(
+                x=[pct], y=["Clientes"], name=row["Segmento"], orientation="h",
+                marker_color=seg_colors.get(row["Segmento"], COLOR_ACCENT),
+                text=[f"{pct:.0f}%"] if pct >= 5 else [None],
+                textposition="inside", textfont=dict(color="white", size=12, family=FONT_FAMILY),
+                hovertemplate=f"<b>{row['Segmento']}</b><br>Clientes: {row['Cantidad']:,}<br>Proporción: {pct}%<extra></extra>",
+            ))
+        fig_nps.update_layout(title=nps_title, barmode="stack", xaxis=dict(range=[0, 100], ticksuffix="%"))
+        fig_nps = apply_corporate_layout(fig_nps, barmode="stack", hide_x_title=True, hide_y_title=True)
+        col_nps_graph = dbc.Col(_G(fig_nps), md=4)
+
+    # GRAPH 3: Sentiment by Channel
+    if df_sent.empty:
+        col_sent = dbc.Col(empty_state(sent_title), md=6)
+    else:
+        bar_colors = [COLOR_DANGER if v < 0 else (COLOR_WARNING if v < 0.1 else COLOR_SUCCESS) for v in df_sent["avg_sentiment"]]
         fig_sent = go.Figure(go.Bar(
-            x=df_sent["avg_sentiment"], y=df_sent["source"],
-            orientation="h",
-            marker_color=bar_colors,
-            hovertemplate="<b>%{y}</b><br>Índice: %{x:.3f}<extra></extra>",
+            x=df_sent["avg_sentiment"], y=df_sent["source"], orientation="h",
+            marker_color=bar_colors, hovertemplate="<b>%{y}</b><br>Índice: %{x:.3f}<extra></extra>",
         ))
         fig_sent.add_vline(x=0, line_dash="dash", line_color=COLOR_NEUTRAL_2, line_width=1)
         fig_sent.update_layout(title=sent_title, xaxis_title="Índice de Satisfacción")
+        fig_sent = apply_corporate_layout(fig_sent, margin=dict(l=150), hide_y_title=True)
+        col_sent = dbc.Col(html.Div([
+            _G(fig_sent),
+            html.P("Índice basado en sentiment_score. El filtro de Acción reduce el universo pero no cambia la definición.",
+                   style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"})
+        ]), md=6)
+
+    # GRAPH 4: Platform Impact
+    if df_impact.empty or (df_impact["pct_positive"].sum() == 0 and df_impact["pct_negative"].sum() == 0):
+        col_impact = dbc.Col(empty_state(impact_title), md=6)
     else:
-        fig_sent = go.Figure().update_layout(title=sent_title)
-    fig_sent = apply_corporate_layout(fig_sent, margin=dict(l=150), hide_y_title=True)
+        fig_impact = px.bar(
+            df_impact, x="source", y=["pct_positive", "pct_negative"], title=impact_title,
+            labels={"source": "Plataforma", "value": "Porcentaje", "pct_positive": "% Satisfechos", "pct_negative": "% Insatisfechos"},
+            barmode="group",
+        )
+        fig_impact.update_traces(hovertemplate="<b>%{x}</b><br>%{data.name}: %{y:.1f}%<extra></extra>")
+        fig_impact = apply_corporate_layout(fig_impact, barmode="group", hide_x_title=True, hide_y_title=True)
+        col_impact = dbc.Col(_G(fig_impact), md=6)
 
-    fig_peaks = px.bar(
-        df_peaks, x="mes_label", y="volumen",
-        title=peaks_title,
-        labels={"mes_label": "Mes", "volumen": "Señales"},
-    )
-    fig_peaks.update_traces(
-        marker_color=COLOR_ACCENT,
-        hovertemplate="<b>%{x}</b><br>Señales: %{y:,}<extra></extra>",
-    )
-    fig_peaks = apply_corporate_layout(fig_peaks, hide_x_title=True, hide_y_title=True)
-
-    fig_impact = px.bar(
-        df_impact, x="source", y=["pct_positive", "pct_negative"],
-        title=impact_title,
-        labels={
-            "source": "Plataforma", "value": "Porcentaje",
-            "pct_positive": "% Satisfechos", "pct_negative": "% Insatisfechos",
-        },
-        barmode="group",
-    )
-    fig_impact.update_traces(
-        hovertemplate="<b>%{x}</b><br>%{data.name}: %{y:.1f}%<extra></extra>",
-    )
-    fig_impact = apply_corporate_layout(fig_impact, barmode="group", hide_x_title=True, hide_y_title=True)
-
-    nps_score = nps["nps_score"]
-    nps_style = STYLE_KPI_SUCCESS if nps_score >= 0 else STYLE_KPI_DANGER
+    # GRAPH 5: Peaks
+    if df_peaks.empty or df_peaks["volumen"].sum() == 0:
+        col_peaks = dbc.Col(empty_state(peaks_title), md=12)
+    else:
+        fig_peaks = px.bar(df_peaks, x="mes_label", y="volumen", title=peaks_title, labels={"mes_label": "Mes", "volumen": "Señales"})
+        fig_peaks.update_traces(marker_color=COLOR_ACCENT, hovertemplate="<b>%{x}</b><br>Señales: %{y:,}<extra></extra>")
+        fig_peaks = apply_corporate_layout(fig_peaks, hide_x_title=True, hide_y_title=True)
+        col_peaks = dbc.Col(_G(fig_peaks), md=12)
 
     warnings = []
     if filters.get("sentiment") and filters["sentiment"] != "ALL":
-        warnings.append(dbc.Alert(
-            "⚠ El filtro de Sentimiento afecta el cálculo del NPS. Para ver el NPS real, usar 'Todos'.",
-            color="warning", className="mb-3 py-2 small"
-        ))
-    
-    action_note = ""
-    if filters.get("actions"):
-        action_note = "Esta métrica no cambia con el filtro de Acción del Cliente. Se basa en la etiqueta de sentimiento."
+        warnings.append(dbc.Alert("⚠ El filtro de Sentimiento afecta el cálculo del NPS. Para ver el NPS real, usar 'Todos'.",
+                                   color="warning", className="mb-3 py-2 small"))
 
     return html.Div([
         html.Div(warnings),
-        dbc.Row([
-            dbc.Col(kpi_card(
-                f"{nps['total_signals']:,}", "Total Señales de Clientes",
-                subtitle="Interacciones registradas en todos los canales digitales",
-            ), md=3),
-            dbc.Col(html.Div(id="kpi-nps-proxy", children=kpi_card(
-                f"{nps_score:+.0f}", "NPS Proxy",
-                nps_style,
-                subtitle=action_note if action_note else "Promotores menos Detractores — rango de −100 a +100",
-            )), md=3),
-            dbc.Col(kpi_card(
-                f"{nps['pct_promoters']}%", "Promotores",
-                STYLE_KPI_SUCCESS,
-                subtitle="Clientes que defienden o recomiendan activamente la marca",
-            ), md=3),
-            dbc.Col(kpi_card(
-                f"{nps['pct_detractors']}%", "Detractores",
-                STYLE_KPI_DANGER,
-                subtitle="Clientes con comportamiento de queja, deserción o malestar",
-            ), md=3),
-        ], className="mb-4 g-3"),
-        dbc.Row([
-            dbc.Col(_G(fig_vel), md=8),
-            dbc.Col(_G(fig_nps), md=4),
-        ], className="mb-4 g-3"),
-        dbc.Row([
-            dbc.Col(html.Div([
-                _G(fig_sent),
-                html.P(
-                    "El Índice de Satisfacción se basa en sentiment_score. El filtro de Acción reduce el universo de registros pero no cambia la definición de la métrica.",
-                    style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"}
-                )
-            ]), md=6),
-            dbc.Col(_G(fig_impact), md=6),
-        ], className="mb-4 g-3"),
-        dbc.Row([
-            dbc.Col(_G(fig_peaks), md=12),
-        ], className="g-3"),
+        dbc.Row([col_total, col_nps, col_prom, col_det], className="mb-4 g-3"),
+        dbc.Row([col_vel, col_nps_graph], className="mb-4 g-3"),
+        dbc.Row([col_sent, col_impact], className="mb-4 g-3"),
+        dbc.Row([col_peaks], className="g-3"),
     ])
 
 
@@ -958,142 +1088,118 @@ def render_general_direction(filters: dict) -> html.Div:
     df_bench, bench_title = get_data_with_fallback(get_competitive_benchmark, filters, "Empresas con Menor Satisfacción de Clientes")
     df_heat, heat_title   = get_data_with_fallback(get_company_product_heatmap, filters, "¿Qué empresa-producto tiene clientes más insatisfechos?")
 
+    # KPI 1: Churn
+    churn_total = kpis["total_churn"]
+    churn_str = f"{churn_total:,}" if churn_total > 0 else "—"
+    churn_sub = "Clientes que expresaron intención de cancelar o buscar alternativas" if churn_total > 0 \
+                else "Sin datos para los filtros seleccionados"
+    col_churn_kpi = dbc.Col(kpi_card(churn_str, "Señales de Deserción", STYLE_KPI_DANGER if churn_total > 0 else STYLE_KPI, subtitle=churn_sub), md=4)
+
+    # KPI 2: Regulatory
+    reg_pct = reg["pct"]
+    reg_str = f"{reg_pct}%" if reg["total"] > 0 else "—"
+    reg_style = (STYLE_KPI_DANGER if reg_pct > 50 else STYLE_KPI_WARNING) if reg["total"] > 0 else STYLE_KPI
+    reg_sub = f"{reg['regulatorias']:,} quejas regulatorias de {reg['total']:,} señales totales" if reg["total"] > 0 \
+              else "Sin datos para los filtros seleccionados"
+    if filters.get("company") or filters.get("actions") or filters.get("sentiment") != "ALL":
+        reg_sub = "Métrica de exposición según filtros activos."
+    col_reg_kpi = dbc.Col(kpi_card(reg_str, "Exposición Regulatoria (CFPB)", reg_style, subtitle=reg_sub), md=4)
+
+    # KPI 3: Pre-churn
+    prechurn_total = int(df_pre["prechurn"].sum()) if not df_pre.empty else 0
+    pre_str = f"{prechurn_total:,}" if prechurn_total > 0 else "—"
+    pre_sub = "Clientes buscando alternativas o reaccionando a cambios de precio o política" if prechurn_total > 0 \
+              else "Sin datos para los filtros seleccionados"
+    col_pre_kpi = dbc.Col(kpi_card(pre_str, "Señales Pre-Deserción", STYLE_KPI_WARNING if prechurn_total > 0 else STYLE_KPI, subtitle=pre_sub), md=4)
+
+    # GRAPH 1: Churn Donut
     dist_df = kpis["distribucion"]
-    if not dist_df.empty and "causa_label" in dist_df.columns:
-        fig_churn = px.pie(
-            dist_df, values="cantidad", names="causa_label", hole=0.5,
-            title=churn_title,
-            labels={"causa_label": "Motivo de Salida", "cantidad": "Clientes Afectados"},
-        )
-        fig_churn.update_traces(
-            hovertemplate="<b>%{label}</b><br>Clientes: %{value:,}<br>Del total: %{percent}<extra></extra>",
-        )
+    if churn_total == 0 or dist_df.empty:
+        col_churn_graph = dbc.Col(empty_state(churn_title), md=5)
     else:
-        fig_churn = go.Figure().update_layout(title=f"{churn_title} — Sin datos suficientes")
-    fig_churn = apply_corporate_layout(fig_churn)
+        fig_churn = px.pie(dist_df, values="cantidad", names="causa_label", hole=0.5, title=churn_title, labels={"causa_label": "Motivo de Salida", "cantidad": "Clientes Afectados"})
+        fig_churn.update_traces(hovertemplate="<b>%{label}</b><br>Clientes: %{value:,}<br>Del total: %{percent}<extra></extra>")
+        fig_churn = apply_corporate_layout(fig_churn)
+        col_churn_graph = dbc.Col(_G(fig_churn), md=5)
 
-    # Pre-churn early warning trend
-    fig_pre = go.Figure()
-    if not df_pre.empty:
+    # GRAPH 2: Pre-churn Trend
+    if df_pre.empty or prechurn_total == 0:
+        col_pre_graph = dbc.Col(empty_state(pre_title), md=7)
+    else:
+        fig_pre = go.Figure()
         fig_pre.add_trace(go.Scatter(
-            x=df_pre["year"], y=df_pre["prechurn"],
-            mode="lines+markers",
-            line=dict(color=COLOR_WARNING, width=2.5),
-            marker=dict(size=7, color=COLOR_WARNING),
-            fill="tozeroy", fillcolor="rgba(255,192,0,0.10)",
-            hovertemplate="<b>%{x}</b><br>Señales Pre-Deserción: %{y:,}<extra></extra>",
+            x=df_pre["year"], y=df_pre["prechurn"], mode="lines+markers",
+            line=dict(color=COLOR_WARNING, width=2.5), marker=dict(size=7, color=COLOR_WARNING),
+            fill="tozeroy", fillcolor="rgba(255,192,0,0.10)", hovertemplate="<b>%{x}</b><br>Señales Pre-Deserción: %{y:,}<extra></extra>",
         ))
-    fig_pre.update_layout(title=pre_title)
-    fig_pre = apply_corporate_layout(fig_pre, hide_x_title=True, hide_y_title=True)
+        fig_pre.update_layout(title=pre_title)
+        fig_pre = apply_corporate_layout(fig_pre, hide_x_title=True, hide_y_title=True)
+        col_pre_graph = dbc.Col(_G(fig_pre), md=7)
 
-    if not df_bench.empty:
+    # GRAPH 3: Benchmark
+    if df_bench.empty:
+        col_bench = dbc.Col(empty_state(bench_title), md=6)
+    else:
         df_b = df_bench.copy()
         df_b["sat_score"] = ((df_b["avg_sentiment"] + 1) / 2 * 100).round(1)
-        # Sort descending so worst company is at TOP of horizontal bar chart
         df_b = df_b.sort_values("sat_score", ascending=False)
-        bar_colors = [
-            COLOR_DANGER if v < 40 else (COLOR_WARNING if v < 55 else COLOR_SUCCESS)
-            for v in df_b["sat_score"]
-        ]
+        bar_colors = [COLOR_DANGER if v < 40 else (COLOR_WARNING if v < 55 else COLOR_SUCCESS) for v in df_b["sat_score"]]
         fig_bench = go.Figure(go.Bar(
-            x=df_b["sat_score"], y=df_b["company"],
-            orientation="h",
-            marker_color=bar_colors,
-            text=[f"{v:.0f}%" for v in df_b["sat_score"]],
-            textposition="outside",
-            textfont=dict(family=FONT_FAMILY, size=11),
-            hovertemplate="<b>%{y}</b><br>Satisfacción: %{x:.1f}%<extra></extra>",
+            x=df_b["sat_score"], y=df_b["company"], orientation="h", marker_color=bar_colors,
+            text=[f"{v:.0f}%" for v in df_b["sat_score"]], textposition="outside",
+            textfont=dict(family=FONT_FAMILY, size=11), hovertemplate="<b>%{y}</b><br>Satisfacción: %{x:.1f}%<extra></extra>",
         ))
-        fig_bench.update_layout(
-            title=bench_title,
-            xaxis=dict(range=[0, 110], ticksuffix="%"),
-        )
-    else:
-        fig_bench = go.Figure().update_layout(title=f"{bench_title} — Sin datos suficientes")
-    fig_bench = apply_corporate_layout(fig_bench, margin=dict(l=160), hide_x_title=True, hide_y_title=True)
+        fig_bench.update_layout(title=bench_title, xaxis=dict(range=[0, 110], ticksuffix="%"))
+        fig_bench = apply_corporate_layout(fig_bench, margin=dict(l=160), hide_x_title=True, hide_y_title=True)
+        col_bench = dbc.Col(html.Div([
+            _G(fig_bench),
+            html.P("Basado en sentiment_score. El filtro de Acción reduce volumen pero no cambia la métrica.",
+                   style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"})
+        ]), md=6)
 
-    if not df_heat.empty:
+    # GRAPH 4: Heatmap
+    if df_heat.empty:
+        col_heat = dbc.Col(empty_state(heat_title), md=6)
+    else:
         df_hd = df_heat.copy()
         df_hd["sat_score"] = ((df_hd["avg_sentiment"] + 1) / 2 * 100).round(0)
-        # Limit to top 8 companies by data coverage for readability
         top_cos = df_hd.groupby("company")["sat_score"].count().nlargest(8).index
         df_hd = df_hd[df_hd["company"].isin(top_cos)]
-        pivot = df_hd.pivot_table(
-            index="company", columns="product_service", values="sat_score", aggfunc="mean"
-        )
-        text_matrix = [
-            [f"{v:.0f}%" if not pd.isna(v) else "" for v in row]
-            for row in pivot.values
-        ]
-        fig_heat = go.Figure(data=go.Heatmap(
-            z=pivot.values,
-            x=pivot.columns.tolist(),
-            y=pivot.index.tolist(),
-            text=text_matrix,
-            texttemplate="%{text}",
-            textfont=dict(size=11, family=FONT_FAMILY),
-            colorscale=[[0, COLOR_DANGER], [0.4, "#FFB68A"], [0.5, "#F5F5F5"], [0.6, "#AED490"], [1, COLOR_SUCCESS]],
-            zmin=0, zmax=100, zmid=50,
-            colorbar=dict(title="Satisf. %", tickfont=dict(family=FONT_FAMILY), ticksuffix="%"),
-            hovertemplate="<b>%{y}</b><br>Producto: %{x}<br>Satisfacción: %{z:.0f}%<extra></extra>",
-        ))
-        fig_heat.update_layout(
-            title=heat_title,
-            font=dict(family=FONT_FAMILY),
-            annotations=[dict(
+        pivot = df_hd.pivot_table(index="company", columns="product_service", values="sat_score", aggfunc="mean")
+        
+        if pivot.empty:
+            col_heat = dbc.Col(empty_state(heat_title), md=6)
+        else:
+            text_matrix = [[f"{v:.0f}%" if not pd.isna(v) else "" for v in row] for row in pivot.values]
+            fig_heat = go.Figure(data=go.Heatmap(
+                z=pivot.values, x=pivot.columns.tolist(), y=pivot.index.tolist(), text=text_matrix,
+                texttemplate="%{text}", textfont=dict(size=11, family=FONT_FAMILY),
+                colorscale=[[0, COLOR_DANGER], [0.4, "#FFB68A"], [0.5, "#F5F5F5"], [0.6, "#AED490"], [1, COLOR_SUCCESS]],
+                zmin=0, zmax=100, zmid=50, colorbar=dict(title="Satisf. %", tickfont=dict(family=FONT_FAMILY), ticksuffix="%"),
+                hovertemplate="<b>%{y}</b><br>Producto: %{x}<br>Satisfacción: %{z:.0f}%<extra></extra>",
+            ))
+            fig_heat.update_layout(title=heat_title, font=dict(family=FONT_FAMILY), annotations=[dict(
                 text="0% = muy insatisfechos · 50% = neutro · 100% = muy satisfechos",
                 x=0.5, y=-0.20, xref="paper", yref="paper", showarrow=False,
                 font=dict(size=10, color=COLOR_NEUTRAL_2, family=FONT_FAMILY),
-            )],
-        )
-    else:
-        fig_heat = go.Figure().update_layout(title=heat_title)
-    fig_heat = apply_corporate_layout(fig_heat, margin=dict(l=160, b=130), hide_x_title=True, hide_y_title=True)
-
-    reg_style = STYLE_KPI_DANGER if reg["pct"] > 50 else STYLE_KPI_WARNING
-    prechurn_total = int(df_pre["prechurn"].sum()) if not df_pre.empty else 0
+            )])
+            fig_heat = apply_corporate_layout(fig_heat, margin=dict(l=160, b=130), hide_x_title=True, hide_y_title=True)
+            col_heat = dbc.Col(html.Div([
+                _G(fig_heat),
+                html.P("Agrupado por promedio de sentimiento. El filtro de Acción reduce el volumen disponible.",
+                       style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"})
+            ]), md=6)
 
     warnings = []
     if filters.get("sentiment") and filters["sentiment"] != "ALL":
-        warnings.append(dbc.Alert(
-            f"Mostrando datos para registros con sentimiento: {filters['sentiment']}. Esto puede sesgar los indicadores de churn y satisfacción.",
-            color="warning", className="mb-3 py-2 small"
-        ))
-
-    reg_note = "Esta métrica no cambia con el filtro de Acción o Sentimiento. El porcentaje varía según la empresa seleccionada."
+        warnings.append(dbc.Alert(f"Mostrando datos para registros con sentimiento: {filters['sentiment']}. Esto puede sesgar indicadores.",
+                                   color="warning", className="mb-3 py-2 small"))
 
     return html.Div([
         html.Div(warnings),
-        dbc.Row([
-            dbc.Col(kpi_card(
-                f"{kpis['total_churn']:,}", "Señales de Deserción", STYLE_KPI_DANGER,
-                subtitle="Clientes que expresaron intención de cancelar o buscar alternativas",
-            ), md=4),
-            dbc.Col(kpi_card(
-                f"{reg['pct']}%", "Exposición Regulatoria (CFPB)", reg_style,
-                subtitle=reg_note if filters.get("company") or filters.get("actions") or filters.get("sentiment") != "ALL" else f"{reg['regulatorias']:,} quejas regulatorias de {reg['total']:,} señales totales",
-            ), md=4),
-            dbc.Col(kpi_card(
-                f"{prechurn_total:,}", "Señales Pre-Deserción", STYLE_KPI_WARNING,
-                subtitle="Clientes buscando alternativas o reaccionando a cambios de precio o política",
-            ), md=4),
-        ], className="mb-4 g-3"),
-        dbc.Row([
-            dbc.Col(_G(fig_churn), md=5),
-            dbc.Col(_G(fig_pre),   md=7),
-        ], className="mb-4 g-3"),
-        dbc.Row([
-            dbc.Col(html.Div([
-                _G(fig_bench),
-                html.P("El Índice de Satisfacción se basa en sentiment_score. El filtro de Acción reduce el volumen pero no cambia la definición de la métrica.",
-                       style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"})
-            ]), md=6),
-            dbc.Col(html.Div([
-                _G(fig_heat),
-                html.P("El heatmap agrupa por promedio de sentimiento. El filtro de Acción reduce el volumen disponible.",
-                       style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"})
-            ]), md=6),
-        ], className="g-3"),
+        dbc.Row([col_churn_kpi, col_reg_kpi, col_pre_kpi], className="mb-4 g-3"),
+        dbc.Row([col_churn_graph, col_pre_graph], className="mb-4 g-3"),
+        dbc.Row([col_bench, col_heat], className="g-3"),
     ])
 
 
@@ -1104,59 +1210,60 @@ def render_retention(filters: dict) -> html.Div:
     df_topics = get_complaint_topics(filters)
     df_map    = get_state_intensity_map(filters)
 
-    fig_radar = go.Figure()
-    if not df_radar.empty:
+    # KPI 1: Escalation Rate
+    esc_str = f"{esc_rate}%" if esc_rate > 0 else "—"
+    esc_sub = "Quejas que escalaron a reclamo formal — indica severidad del problema" if esc_rate > 0 \
+              else "Sin datos para los filtros seleccionados"
+    col_esc_kpi = dbc.Col(kpi_card(esc_str, "Tasa de Escalada", STYLE_KPI_DANGER if esc_rate > 0 else STYLE_KPI, subtitle=esc_sub), md=6)
+
+    # KPI 2: Cycle Time
+    avg_cycle_str = f"{avg_cycle} días" if avg_cycle > 0 else "—"
+    avg_cycle_sub = "Días promedio entre la primera señal negativa y la cancelación" if avg_cycle > 0 \
+                    else "Sin datos para los filtros seleccionados"
+    col_cycle_kpi = dbc.Col(kpi_card(avg_cycle_str, "Tiempo Hasta la Deserción", STYLE_KPI_WARNING if avg_cycle > 0 else STYLE_KPI, subtitle=avg_cycle_sub), md=6)
+
+    # GRAPH 1: Radar
+    radar_title = "Productos con Mayor Riesgo de Deserción"
+    if df_radar.empty or len(df_radar) < 3:
+        col_radar = dbc.Col(empty_state(radar_title), md=6)
+    else:
+        fig_radar = go.Figure()
         fig_radar.add_trace(go.Scatterpolar(
             r=df_radar["score"], theta=df_radar["product"], fill="toself",
             line_color=COLOR_PRIMARY, fillcolor="rgba(31, 78, 120, 0.12)",
             hovertemplate="<b>%{theta}</b><br>Nivel de Riesgo: %{r:.1f} / 100<extra></extra>",
         ))
-    fig_radar.update_layout(
-        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-        title="Productos con Mayor Riesgo de Deserción",
-        font=dict(family=FONT_FAMILY, color=COLOR_NEUTRAL_DARK),
-    )
+        fig_radar.update_layout(
+            polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+            title=radar_title,
+            font=dict(family=FONT_FAMILY, color=COLOR_NEUTRAL_DARK),
+        )
+        col_radar = dbc.Col(_G(fig_radar), md=6)
 
-    fig_topics = px.bar(
-        df_topics, x="Frecuencia", y="Topic", orientation="h",
-        title="Principales Motivos de Queja",
-        labels={"Frecuencia": "Menciones en Reseñas", "Topic": "Categoría"},
-    )
-    fig_topics.update_traces(
-        marker_color=COLOR_DANGER,
-        hovertemplate="<b>%{y}</b><br>Menciones: %{x:,}<extra></extra>",
-    )
-    fig_topics = apply_corporate_layout(fig_topics, margin=dict(l=180), hide_x_title=True, hide_y_title=True)
+    # GRAPH 2: Topics
+    topics_title = "Principales Motivos de Queja"
+    if df_topics.empty or df_topics["Frecuencia"].sum() == 0:
+        col_topics = dbc.Col(empty_state(topics_title), md=6)
+    else:
+        fig_topics = px.bar(df_topics, x="Frecuencia", y="Topic", orientation="h", title=topics_title, labels={"Frecuencia": "Menciones en Reseñas", "Topic": "Categoría"})
+        fig_topics.update_traces(marker_color=COLOR_DANGER, hovertemplate="<b>%{y}</b><br>Menciones: %{x:,}<extra></extra>")
+        fig_topics = apply_corporate_layout(fig_topics, margin=dict(l=180), hide_x_title=True, hide_y_title=True)
+        col_topics = dbc.Col(_G(fig_topics), md=6)
 
-    fig_map = px.bar(
-        df_map, x="estado", y="quejas",
-        title="Concentración Geográfica de Quejas",
-        labels={"estado": "Estado / Región", "quejas": "Quejas Registradas"},
-    )
-    fig_map.update_traces(
-        marker_color=COLOR_WARNING,
-        hovertemplate="<b>%{x}</b><br>Quejas: %{y:,}<extra></extra>",
-    )
-    fig_map = apply_corporate_layout(fig_map, hide_x_title=True, hide_y_title=True)
-
-    avg_cycle_str = f"{avg_cycle} días" if avg_cycle > 0 else "N/D"
+    # GRAPH 3: Map
+    map_title = "Concentración Geográfica de Quejas"
+    if df_map.empty or df_map["quejas"].sum() == 0:
+        col_map = dbc.Col(empty_state(map_title), md=12)
+    else:
+        fig_map = px.bar(df_map, x="estado", y="quejas", title=map_title, labels={"estado": "Estado / Región", "quejas": "Quejas Registradas"})
+        fig_map.update_traces(marker_color=COLOR_WARNING, hovertemplate="<b>%{x}</b><br>Quejas: %{y:,}<extra></extra>")
+        fig_map = apply_corporate_layout(fig_map, hide_x_title=True, hide_y_title=True)
+        col_map = dbc.Col(_G(fig_map), md=12)
 
     return html.Div([
-        dbc.Row([
-            dbc.Col(kpi_card(
-                f"{esc_rate}%", "Tasa de Escalada", STYLE_KPI_DANGER,
-                subtitle="Quejas que escalaron a reclamo formal — indica severidad del problema",
-            ), md=6),
-            dbc.Col(kpi_card(
-                avg_cycle_str, "Tiempo Hasta la Deserción", STYLE_KPI_WARNING,
-                subtitle="Días promedio entre la primera señal negativa y la cancelación",
-            ), md=6),
-        ], className="mb-4 g-3"),
-        dbc.Row([
-            dbc.Col(_G(fig_radar),  md=6),
-            dbc.Col(_G(fig_topics), md=6),
-        ], className="mb-4 g-3"),
-        dbc.Row([dbc.Col(_G(fig_map), md=12)], className="g-3"),
+        dbc.Row([col_esc_kpi, col_cycle_kpi], className="mb-4 g-3"),
+        dbc.Row([col_radar, col_topics], className="mb-4 g-3"),
+        dbc.Row([col_map], className="g-3"),
     ])
 
 
@@ -1223,8 +1330,12 @@ def render_product_team(filters: dict) -> html.Div:
         "boxShadow": "0 2px 10px rgba(31,78,120,0.07)",
     })
 
-    fig_dev = go.Figure()
-    if not df_dev.empty:
+    # GRAPH 1: Device Comparison
+    dev_title = "Satisfacción vs Calificación por Plataforma"
+    if df_dev.empty:
+        col_dev = dbc.Col(empty_state(dev_title), md=6)
+    else:
+        fig_dev = go.Figure()
         if "avg_rating" in df_dev.columns:
             sentiment_norm = ((df_dev["avg_sentiment"] + 1) / 2) * 5
             fig_dev.add_trace(go.Bar(
@@ -1238,10 +1349,7 @@ def render_product_team(filters: dict) -> html.Div:
                 orientation="h", marker_color=COLOR_ACCENT,
                 hovertemplate="<b>%{y}</b><br>Calificación: %{x:.2f} / 5 ★<extra></extra>",
             ))
-            fig_dev.update_layout(
-                title="Satisfacción vs Calificación por Plataforma (escala 0–5)",
-                xaxis=dict(range=[0, 5]),
-            )
+            fig_dev.update_layout(title=dev_title + " (escala 0–5)", xaxis=dict(range=[0, 5]))
         else:
             fig_dev.add_trace(go.Bar(
                 y=df_dev["source"], x=df_dev["avg_sentiment"], name="Índice de Satisfacción",
@@ -1249,31 +1357,41 @@ def render_product_team(filters: dict) -> html.Div:
                 hovertemplate="<b>%{y}</b><br>Índice de Satisfacción: %{x:.3f}<extra></extra>",
             ))
             fig_dev.update_layout(title="Satisfacción por Plataforma Móvil")
+        fig_dev = apply_corporate_layout(fig_dev, barmode="group", margin=dict(l=120), hide_x_title=True, hide_y_title=True)
+        col_dev = dbc.Col(_G(fig_dev), md=6)
+
+    # GRAPH 2: Star distribution
+    stars_title = "Distribución de Calificaciones"
+    if df_stars.empty or df_stars["cantidad"].sum() == 0:
+        col_stars = dbc.Col(empty_state(stars_title), md=6)
     else:
-        fig_dev.add_annotation(
-            text="No se encontraron datos de App Store o Google Play.<br>"
-                 "Verificá que el dataset incluya la columna 'source' con valores 'AppStore' o 'Google Play'.",
-            xref="paper", yref="paper", x=0.5, y=0.5,
-            showarrow=False,
-            font=dict(size=13, color=COLOR_NEUTRAL_2, family=FONT_FAMILY),
-            align="center",
-        )
-        fig_dev.update_layout(title="Sin datos de plataformas móviles")
-    fig_dev = apply_corporate_layout(fig_dev, barmode="group", margin=dict(l=120), hide_x_title=True, hide_y_title=True)
+        star_colors = [COLOR_DANGER, COLOR_DANGER, COLOR_WARNING, COLOR_SUCCESS, COLOR_SUCCESS]
+        fig_stars = go.Figure()
+        fig_stars.add_trace(go.Bar(
+            x=df_stars["estrella_label"], y=df_stars["cantidad"],
+            marker_color=star_colors[:len(df_stars)],
+            hovertemplate="<b>%{x}</b><br>Reseñas: %{y:,}<extra></extra>",
+        ))
+        fig_stars.update_layout(title=stars_title + " — App Store & Google Play")
+        fig_stars = apply_corporate_layout(fig_stars, hide_x_title=True, hide_y_title=True)
+        col_stars = dbc.Col(_G(fig_stars), md=6)
 
-    fig_nlp = px.bar(
-        df_nlp, x="Frecuencia", y="Problema", orientation="h",
-        title="Problemas Técnicos Más Reportados",
-        labels={"Frecuencia": "Cantidad de Reportes", "Problema": "Tipo de Problema"},
-    )
-    fig_nlp.update_traces(
-        marker_color=COLOR_DANGER,
-        hovertemplate="<b>%{y}</b><br>Reportes: %{x:,}<extra></extra>",
-    )
-    fig_nlp = apply_corporate_layout(fig_nlp, margin=dict(l=150), hide_x_title=True, hide_y_title=True)
+    # GRAPH 3: NLP Issues
+    nlp_title = "Problemas Técnicos Más Reportados"
+    if df_nlp.empty or df_nlp["Frecuencia"].sum() == 0:
+        col_nlp = dbc.Col(empty_state(nlp_title), md=6)
+    else:
+        fig_nlp = px.bar(df_nlp, x="Frecuencia", y="Problema", orientation="h", title=nlp_title, labels={"Frecuencia": "Cantidad de Reportes", "Problema": "Tipo de Problema"})
+        fig_nlp.update_traces(marker_color=COLOR_DANGER, hovertemplate="<b>%{y}</b><br>Reportes: %{x:,}<extra></extra>")
+        fig_nlp = apply_corporate_layout(fig_nlp, margin=dict(l=150), hide_x_title=True, hide_y_title=True)
+        col_nlp = dbc.Col(_G(fig_nlp), md=6)
 
-    fig_yoy = go.Figure()
-    if not df_yoy.empty:
+    # GRAPH 4: YoY Trend
+    yoy_title = "Tendencia Anual: Volumen de Reseñas vs Satisfacción"
+    if df_yoy.empty:
+        col_yoy = dbc.Col(empty_state(yoy_title), md=6)
+    else:
+        fig_yoy = go.Figure()
         fig_yoy.add_trace(go.Bar(
             x=df_yoy["year"], y=df_yoy["volumen"], name="Volumen de Reseñas",
             marker_color=COLOR_BORDER, yaxis="y1",
@@ -1285,42 +1403,18 @@ def render_product_team(filters: dict) -> html.Div:
             line=dict(width=2.5), yaxis="y2",
             hovertemplate="<b>%{x}</b><br>Índice de Satisfacción: %{y:.3f}<extra></extra>",
         ))
-    fig_yoy.update_layout(
-        title="Tendencia Anual: Volumen de Reseñas vs Satisfacción",
-        yaxis=dict(title="Volumen de Reseñas", side="left"),
-        yaxis2=dict(title="Índice de Satisfacción", side="right", overlaying="y", showgrid=False),
-    )
-    fig_yoy = apply_corporate_layout(fig_yoy, hide_x_title=True)
-
-    # Star rating distribution
-    fig_stars = go.Figure()
-    if not df_stars.empty and df_stars["cantidad"].sum() > 0:
-        star_colors = [COLOR_DANGER, COLOR_DANGER, COLOR_WARNING, COLOR_SUCCESS, COLOR_SUCCESS]
-        fig_stars.add_trace(go.Bar(
-            x=df_stars["estrella_label"],
-            y=df_stars["cantidad"],
-            marker_color=star_colors[:len(df_stars)],
-            hovertemplate="<b>%{x}</b><br>Reseñas: %{y:,}<extra></extra>",
-        ))
-    else:
-        fig_stars.add_annotation(
-            text="Sin datos de calificaciones para este período",
-            xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
-            font=dict(color=COLOR_NEUTRAL_2, size=13),
+        fig_yoy.update_layout(
+            title=yoy_title,
+            yaxis=dict(title="Volumen de Reseñas", side="left"),
+            yaxis2=dict(title="Índice de Satisfacción", side="right", overlaying="y", showgrid=False),
         )
-    fig_stars.update_layout(title="Distribución de Calificaciones — App Store & Google Play")
-    fig_stars = apply_corporate_layout(fig_stars, hide_x_title=True, hide_y_title=True)
+        fig_yoy = apply_corporate_layout(fig_yoy, hide_x_title=True)
+        col_yoy = dbc.Col(_G(fig_yoy), md=6)
 
     return html.Div([
         banner,
-        dbc.Row([
-            dbc.Col(_G(fig_dev),   md=6),
-            dbc.Col(_G(fig_stars), md=6),
-        ], className="mb-4 g-3"),
-        dbc.Row([
-            dbc.Col(_G(fig_nlp), md=6),
-            dbc.Col(_G(fig_yoy), md=6),
-        ], className="g-3"),
+        dbc.Row([col_dev, col_stars], className="mb-4 g-3"),
+        dbc.Row([col_nlp, col_yoy], className="g-3"),
     ])
 
 

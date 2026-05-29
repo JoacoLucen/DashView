@@ -136,6 +136,10 @@ def _ensure_datasets_schema(cursor: sqlite3.Cursor) -> None:
         pass
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_signals_main ON client_signals (company, year, month);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_signals_dataset ON client_signals (dataset_id);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_source ON client_signals (source);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_product ON client_signals (product_service);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_action ON client_signals (customer_action);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sentiment ON client_signals (sentiment_label);")
 
 
 # ── Public dataset management API ─────────────────────────────────────────────
