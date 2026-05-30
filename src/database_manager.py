@@ -15,6 +15,16 @@ def _build_dynamic_query(base_query: str, filters: dict) -> tuple:
         conditions.append("year BETWEEN ? AND ?")
         params.extend([int(filters["period"][0]), int(filters["period"][1])])
 
+    if filters.get("years"):
+        placeholders = ",".join(["?"] * len(filters["years"]))
+        conditions.append(f"year IN ({placeholders})")
+        params.extend([int(y) for y in filters["years"]])
+
+    if filters.get("months"):
+        placeholders = ",".join(["?"] * len(filters["months"]))
+        conditions.append(f"month IN ({placeholders})")
+        params.extend([int(m) for m in filters["months"]])
+
     if filters.get("sources"):
         placeholders = ",".join(["?"] * len(filters["sources"]))
         conditions.append(f"source IN ({placeholders})")
@@ -111,13 +121,14 @@ def get_filter_options(active_filters: dict) -> dict:
     if not os.path.exists(DB_PATH):
         return {k: [] for k in ['years', 'sources', 'companies', 'products', 'actions']}
 
-    def _query_options(dimension_col: str, exclude_key: str,
-                       filters: dict, min_count: int = 1) -> list:
+    def _query_options(dimension_col: str, exclude_key, filters: dict,
+                       min_count: int = 1) -> list:
         """
         Consulta los valores distintos de dimension_col aplicando todos
-        los filtros EXCEPTO el filtro de exclude_key.
+        los filtros EXCEPTO el/los filtro(s) de exclude_key (str o iterable).
         """
-        restricted = {k: v for k, v in filters.items() if k != exclude_key}
+        exclude = {exclude_key} if isinstance(exclude_key, str) else set(exclude_key)
+        restricted = {k: v for k, v in filters.items() if k not in exclude}
         base = f"""
             SELECT {dimension_col}, COUNT(*) as cnt
             FROM client_signals
@@ -150,8 +161,8 @@ def get_filter_options(active_filters: dict) -> dict:
         'researching', 'discussing',
     }
 
-    # Años disponibles
-    year_vals, year_cnts = _query_options("year", "period", active_filters)
+    # Años disponibles (excluye el propio filtro de período en cualquiera de sus formas)
+    year_vals, year_cnts = _query_options("year", ("period", "years", "months"), active_filters)
     year_opts = [
         {"label": str(y), "value": y}
         for y in sorted(year_vals)

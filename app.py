@@ -5,7 +5,7 @@ import threading
 import zipfile
 import shutil
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import dcc, html, Input, Output, State, ctx, ALL
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import plotly.express as px
@@ -24,8 +24,9 @@ from src.metrics import (
 )
 from src.etl_pipeline import (
     TARGET_DB_PATH, STAGING_DIR, EXTRACTED_DIR, UPLOADED_ZIP_PATH,
-    cleanup_staging, process_zip_file,
+    cleanup_staging, process_zip_file, process_local_file,
     get_datasets, delete_dataset, delete_all_datasets,
+    scan_available_datasets, reconcile_datasets,
 )
 
 # =============================================================================
@@ -45,6 +46,50 @@ COLOR_BORDER       = "#E8EEF4"
 
 FONT_FAMILY = "'DM Sans', 'Segoe UI', system-ui, sans-serif"
 FONT_MONO   = "'DM Mono', 'Cascadia Code', 'Courier New', monospace"
+
+# Meses para el selector "Años y meses concretos"
+MONTH_OPTIONS = [
+    {"label": "Ene", "value": 1}, {"label": "Feb", "value": 2}, {"label": "Mar", "value": 3},
+    {"label": "Abr", "value": 4}, {"label": "May", "value": 5}, {"label": "Jun", "value": 6},
+    {"label": "Jul", "value": 7}, {"label": "Ago", "value": 8}, {"label": "Sep", "value": 9},
+    {"label": "Oct", "value": 10}, {"label": "Nov", "value": 11}, {"label": "Dic", "value": 12},
+]
+
+# Filtros y plataformas relevantes por stakeholder (pestaña).
+# "sources": None = todas las plataformas. "visible": columnas de filtro a mostrar
+# (además de Período, que siempre se muestra).
+ALL_FILTER_COLS = ["source", "company", "product", "action", "sentiment"]
+TAB_FILTER_CONFIG = {
+    "tab-marketing": {
+        "sources": ["Reddit", "HackerNews", "Trustpilot", "GDELT", "Google_Trends", "AppStore", "GooglePlay"],
+        "visible": ["source", "product", "action", "sentiment"],
+    },
+    "tab-dir-general": {
+        "sources": None,
+        "visible": ["source", "company", "product", "action", "sentiment"],
+    },
+    "tab-retencion": {
+        "sources": ["CFPB", "Trustpilot"],
+        "visible": ["source", "product", "action", "sentiment"],
+    },
+    "tab-producto": {
+        "sources": ["AppStore", "GooglePlay"],
+        "visible": ["source", "product", "sentiment"],
+    },
+}
+
+
+def _build_period_filters(mode, year_from, year_to, years_multi, months_multi) -> dict:
+    """Traduce el modo de período + selecciones a claves de filtro de query."""
+    out = {}
+    if mode == "rango":
+        out["period"] = [year_from or 2010, year_to or 2027]
+    elif mode in ("anios", "anios_meses"):
+        if years_multi:
+            out["years"] = [int(y) for y in years_multi]
+        if mode == "anios_meses" and months_multi:
+            out["months"] = [int(m) for m in months_multi]
+    return out
 
 _OVERLAY_VISIBLE = {
     "position": "fixed", "top": 0, "left": 0,
@@ -257,6 +302,60 @@ def _build_datasets_checklist(datasets: list):
     )
 
 
+def _human_size(num_bytes: int) -> str:
+    size = float(num_bytes or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _build_available_section(available: list):
+    """Sección 'Disponibles para importar' del modal: archivos detectados en staging."""
+    pending = [a for a in available if not a["imported"]]
+    if not pending:
+        return None
+    rows = []
+    for item in pending:
+        rows.append(html.Div(
+            [
+                html.Div([
+                    html.I(className="bi bi-file-earmark-arrow-down me-2", style={"color": COLOR_ACCENT}),
+                    html.Span(item["name"], style={"fontWeight": "600", "fontSize": "0.85rem", "color": COLOR_NEUTRAL_DARK}),
+                    html.Span(
+                        f"  ·  {item['ext'][1:].upper()}  ·  {_human_size(item['size_bytes'])}",
+                        style={"fontSize": "0.75rem", "color": COLOR_NEUTRAL_2},
+                    ),
+                ], style={"flex": "1", "minWidth": "0", "overflow": "hidden", "textOverflow": "ellipsis", "whiteSpace": "nowrap"}),
+                dbc.Button(
+                    [html.I(className="bi bi-download me-1"), "Importar"],
+                    id={"type": "btn-import-available", "index": item["path"]},
+                    color="primary", outline=True, size="sm", n_clicks=0,
+                    style={"fontSize": "0.72rem", "fontWeight": "600", "flexShrink": "0"},
+                ),
+            ],
+            style={
+                "display": "flex", "alignItems": "center", "gap": "10px",
+                "padding": "10px 4px", "borderBottom": f"1px solid {COLOR_BORDER}",
+            },
+        ))
+    return html.Div([
+        html.Div([
+            html.I(className="bi bi-folder2-open me-2", style={"color": COLOR_ACCENT}),
+            html.Span("Disponibles para importar", style={
+                "fontWeight": "700", "fontSize": "0.72rem", "letterSpacing": "0.08em",
+                "textTransform": "uppercase", "color": COLOR_NEUTRAL_2,
+            }),
+        ], style={"marginTop": "18px", "marginBottom": "6px"}),
+        html.P(
+            "Archivos detectados en data/staging que aún no fueron importados. La carga es acumulativa.",
+            style={"fontSize": "0.74rem", "color": COLOR_NEUTRAL_2, "marginBottom": "8px"},
+        ),
+        html.Div(rows),
+    ])
+
+
 # =============================================================================
 # APP INITIALIZATION
 # =============================================================================
@@ -273,6 +372,13 @@ app = dash.Dash(
 
 for path in [STAGING_DIR, EXTRACTED_DIR]:
     os.makedirs(path, exist_ok=True)
+
+# Reconciliar el inventario de datasets con la DB real al arrancar
+try:
+    if os.path.exists(TARGET_DB_PATH):
+        reconcile_datasets()
+except Exception as _e:
+    print(f"[startup reconcile_datasets] {_e}")
 
 # =============================================================================
 # LAYOUT
@@ -397,46 +503,112 @@ app.layout = html.Div(
                                     dbc.Row([
                                         dbc.Col(md=2, children=[
                                             html.Label([html.I(className="bi bi-calendar3 me-1"), "Período"], style=STYLE_FILTER_LABEL),
-                                            html.Div([
-                                                dcc.Dropdown(
-                                                    id="filter-year-from",
-                                                    options=[{"label": str(y), "value": y} for y in range(2010, 2028)],
-                                                    value=2010,
-                                                    clearable=False,
-                                                    style={"fontSize": "13px", "width": "90px"},
+                                            dcc.Dropdown(
+                                                id="filter-period-mode",
+                                                clearable=False,
+                                                value="rango",
+                                                options=[
+                                                    {"label": "Período (rango)", "value": "rango"},
+                                                    {"label": "Años concretos", "value": "anios"},
+                                                    {"label": "Años y meses concretos", "value": "anios_meses"},
+                                                ],
+                                                style={"fontSize": "13px", "marginBottom": "6px"},
+                                            ),
+                                            html.Div(
+                                                id="period-range-container",
+                                                children=html.Div([
+                                                    dcc.Dropdown(
+                                                        id="filter-year-from",
+                                                        options=[{"label": str(y), "value": y} for y in range(2010, 2028)],
+                                                        value=2010,
+                                                        clearable=False,
+                                                        style={"fontSize": "13px", "width": "90px"},
+                                                    ),
+                                                    html.Span("—", style={
+                                                        "padding": "0 6px",
+                                                        "color": COLOR_NEUTRAL_2,
+                                                        "lineHeight": "36px",
+                                                        "fontSize": "14px",
+                                                    }),
+                                                    dcc.Dropdown(
+                                                        id="filter-year-to",
+                                                        options=[{"label": str(y), "value": y} for y in range(2010, 2028)],
+                                                        value=2027,
+                                                        clearable=False,
+                                                        style={"fontSize": "13px", "width": "90px"},
+                                                    ),
+                                                ], style={"display": "flex", "alignItems": "center"}),
+                                            ),
+                                            html.Div(
+                                                id="period-years-container",
+                                                style={"display": "none"},
+                                                children=dbc.DropdownMenu(
+                                                    id="years-dropdown-menu",
+                                                    label="Elegir años",
+                                                    color="light",
+                                                    size="sm",
+                                                    toggle_style={
+                                                        "fontSize": "13px", "width": "100%",
+                                                        "textAlign": "left",
+                                                        "border": f"1px solid {COLOR_BORDER}",
+                                                        "backgroundColor": "#FFFFFF",
+                                                        "color": COLOR_NEUTRAL_DARK,
+                                                    },
+                                                    children=html.Div(
+                                                        dcc.Checklist(
+                                                            id="filter-years-multi",
+                                                            options=[], value=[],
+                                                            labelStyle={"display": "block", "padding": "3px 0", "fontSize": "13px", "cursor": "pointer"},
+                                                            inputStyle={"marginRight": "8px", "accentColor": COLOR_PRIMARY},
+                                                        ),
+                                                        style={"maxHeight": "240px", "overflowY": "auto", "padding": "6px 14px", "minWidth": "150px"},
+                                                    ),
                                                 ),
-                                                html.Span("—", style={
-                                                    "padding": "0 6px",
-                                                    "color": COLOR_NEUTRAL_2,
-                                                    "lineHeight": "36px",
-                                                    "fontSize": "14px",
-                                                }),
-                                                dcc.Dropdown(
-                                                    id="filter-year-to",
-                                                    options=[{"label": str(y), "value": y} for y in range(2010, 2028)],
-                                                    value=2027,
-                                                    clearable=False,
-                                                    style={"fontSize": "13px", "width": "90px"},
+                                            ),
+                                            html.Div(
+                                                id="period-months-container",
+                                                style={"display": "none"},
+                                                children=dbc.DropdownMenu(
+                                                    id="months-dropdown-menu",
+                                                    label="Elegir meses",
+                                                    color="light",
+                                                    size="sm",
+                                                    toggle_style={
+                                                        "fontSize": "13px", "width": "100%",
+                                                        "textAlign": "left", "marginTop": "6px",
+                                                        "border": f"1px solid {COLOR_BORDER}",
+                                                        "backgroundColor": "#FFFFFF",
+                                                        "color": COLOR_NEUTRAL_DARK,
+                                                    },
+                                                    children=html.Div(
+                                                        dcc.Checklist(
+                                                            id="filter-months-multi",
+                                                            options=MONTH_OPTIONS, value=[],
+                                                            labelStyle={"display": "block", "padding": "3px 0", "fontSize": "13px", "cursor": "pointer"},
+                                                            inputStyle={"marginRight": "8px", "accentColor": COLOR_PRIMARY},
+                                                        ),
+                                                        style={"maxHeight": "240px", "overflowY": "auto", "padding": "6px 14px", "minWidth": "130px"},
+                                                    ),
                                                 ),
-                                            ], style={"display": "flex", "alignItems": "center"}),
+                                            ),
                                         ]),
-                                        dbc.Col(md=2, children=[
+                                        dbc.Col(md=2, id="col-filter-source", children=[
                                             html.Label([html.I(className="bi bi-broadcast me-1"), "Plataforma"], style=STYLE_FILTER_LABEL),
                                             dcc.Dropdown(id="filter-source", multi=True, placeholder="Todas", style={"fontSize": "13px"}),
                                         ]),
-                                        dbc.Col(md=2, children=[
+                                        dbc.Col(md=2, id="col-filter-company", children=[
                                             html.Label([html.I(className="bi bi-building me-1"), "Empresa"], style=STYLE_FILTER_LABEL),
                                             dcc.Dropdown(id="filter-company", multi=True, placeholder="Todas", style={"fontSize": "13px"}),
                                         ]),
-                                        dbc.Col(md=2, children=[
+                                        dbc.Col(md=2, id="col-filter-product", children=[
                                             html.Label([html.I(className="bi bi-box-seam me-1"), "Producto"], style=STYLE_FILTER_LABEL),
                                             dcc.Dropdown(id="filter-product", multi=True, placeholder="Todos", style={"fontSize": "13px"}),
                                         ]),
-                                        dbc.Col(md=2, children=[
+                                        dbc.Col(md=2, id="col-filter-action", children=[
                                             html.Label([html.I(className="bi bi-cursor me-1"), "Acción"], style=STYLE_FILTER_LABEL),
                                             dcc.Dropdown(id="filter-action", multi=True, placeholder="Todas", style={"fontSize": "13px"}),
                                         ]),
-                                        dbc.Col(md=2, children=[
+                                        dbc.Col(md=2, id="col-filter-sentiment", children=[
                                             html.Label([html.I(className="bi bi-emoji-smile me-1"), "Sentimiento"], style=STYLE_FILTER_LABEL),
                                             dcc.RadioItems(
                                                 id="filter-sentiment", inline=True, className="mt-1",
@@ -611,6 +783,9 @@ def sync_year_dropdowns(year_from, year_to, available_years):
     Output("filter-product", "value"),
     Output("filter-action", "value"),
     Output("filter-sentiment", "value"),
+    Output("filter-period-mode", "value"),
+    Output("filter-years-multi", "value"),
+    Output("filter-months-multi", "value"),
     Input("btn-clear-filters", "n_clicks"),
     State("available-years-list", "data"),
     prevent_initial_call=True,
@@ -618,7 +793,87 @@ def sync_year_dropdowns(year_from, year_to, available_years):
 def clear_filters(n, available_years):
     y_min = min(available_years) if available_years else 2010
     y_max = max(available_years) if available_years else 2027
-    return y_min, y_max, None, None, None, None, "ALL"
+    return y_min, y_max, None, None, None, None, "ALL", "rango", [], []
+
+
+@app.callback(
+    Output("period-range-container", "style"),
+    Output("period-years-container", "style"),
+    Output("period-months-container", "style"),
+    Input("filter-period-mode", "value"),
+)
+def toggle_period_mode(mode):
+    show, hide = {"display": "block"}, {"display": "none"}
+    if mode == "anios":
+        return hide, show, hide
+    if mode == "anios_meses":
+        return hide, show, show
+    return show, hide, hide
+
+
+@app.callback(
+    Output("years-dropdown-menu", "label"),
+    Input("filter-years-multi", "value"),
+)
+def update_years_label(years):
+    return f"Años ({len(years)})" if years else "Elegir años"
+
+
+@app.callback(
+    Output("months-dropdown-menu", "label"),
+    Input("filter-months-multi", "value"),
+)
+def update_months_label(months):
+    return f"Meses ({len(months)})" if months else "Elegir meses"
+
+
+@app.callback(
+    Output("col-filter-source", "style"),
+    Output("col-filter-company", "style"),
+    Output("col-filter-product", "style"),
+    Output("col-filter-action", "style"),
+    Output("col-filter-sentiment", "style"),
+    Input("tabs-stakeholders", "active_tab"),
+)
+def toggle_filter_columns(tab):
+    cfg = TAB_FILTER_CONFIG.get(tab, {})
+    visible = cfg.get("visible", ALL_FILTER_COLS)
+    return tuple({} if name in visible else {"display": "none"} for name in ALL_FILTER_COLS)
+
+
+@app.callback(
+    Output("filter-source", "value", allow_duplicate=True),
+    Output("filter-company", "value", allow_duplicate=True),
+    Output("filter-product", "value", allow_duplicate=True),
+    Output("filter-action", "value", allow_duplicate=True),
+    Output("filter-sentiment", "value", allow_duplicate=True),
+    Input("tabs-stakeholders", "active_tab"),
+    State("filter-source", "value"),
+    State("filter-company", "value"),
+    State("filter-product", "value"),
+    State("filter-action", "value"),
+    State("filter-sentiment", "value"),
+    prevent_initial_call=True,
+)
+def prune_filters_on_tab_change(tab, sources, companies, products, actions, sentiment):
+    """Al cambiar de pestaña, limpia valores de filtros ocultos y plataformas no válidas."""
+    cfg = TAB_FILTER_CONFIG.get(tab, {})
+    visible = cfg.get("visible", ALL_FILTER_COLS)
+    allowed_sources = cfg.get("sources")
+
+    if "source" not in visible:
+        new_sources = None
+    elif allowed_sources is not None and sources:
+        src_list = sources if isinstance(sources, list) else [sources]
+        new_sources = [s for s in src_list if s in allowed_sources] or None
+    else:
+        new_sources = sources
+
+    new_companies = companies if "company" in visible else None
+    new_products  = products if "product" in visible else None
+    new_actions   = actions if "action" in visible else None
+    new_sentiment = sentiment if "sentiment" in visible else "ALL"
+    return new_sources, new_companies, new_products, new_actions, new_sentiment
 
 
 @app.callback(
@@ -640,6 +895,9 @@ def show_import_overlay(n):
     Input("tabs-stakeholders", "active_tab"),
     Input("filter-year-from", "value"),
     Input("filter-year-to", "value"),
+    Input("filter-period-mode", "value"),
+    Input("filter-years-multi", "value"),
+    Input("filter-months-multi", "value"),
     Input("filter-source", "value"),
     Input("filter-company", "value"),
     Input("filter-product", "value"),
@@ -648,16 +906,18 @@ def show_import_overlay(n):
     Input("processing-status", "data"),
     prevent_initial_call='initial_duplicate',
 )
-def update_view(tab, year_from, year_to, sources, companies, products, actions, sentiment, proc_status):
+def update_view(tab, year_from, year_to, period_mode, years_multi, months_multi,
+                sources, companies, products, actions, sentiment, proc_status):
     if not os.path.exists(TARGET_DB_PATH):
         return html.Div(), dash.no_update, {"display": "none"}
     if proc_status.get("status") == "processing":
         return dash.no_update, dash.no_update, dash.no_update
 
     filters = {
-        "period": [year_from or 2010, year_to or 2027], "sources": sources, "companies": companies,
-        "products": products, "actions": actions, "sentiment": sentiment,
+        "sources": sources, "companies": companies, "products": products,
+        "actions": actions, "sentiment": sentiment,
     }
+    filters.update(_build_period_filters(period_mode, year_from, year_to, years_multi, months_multi))
 
     try:
         if   tab == "tab-marketing":    view = render_marketing(filters)
@@ -679,23 +939,29 @@ def update_view(tab, year_from, year_to, sources, companies, products, actions, 
     Output("filter-company", "options"),
     Output("filter-product", "options"),
     Output("filter-action",  "options"),
-    Output("filter-year-from", "options"),
-    Output("filter-year-to",   "options"),
+    Output("filter-year-from", "options", allow_duplicate=True),
+    Output("filter-year-to",   "options", allow_duplicate=True),
+    Output("filter-years-multi", "options"),
     Input("processing-status",  "data"),
+    Input("filter-period-mode", "value"),
     Input("filter-year-from",   "value"),
     Input("filter-year-to",     "value"),
+    Input("filter-years-multi", "value"),
+    Input("filter-months-multi", "value"),
     Input("filter-source",      "value"),
     Input("filter-company",     "value"),
     Input("filter-product",     "value"),
     Input("filter-action",      "value"),
     Input("filter-sentiment",   "value"),
+    Input("tabs-stakeholders",  "active_tab"),
+    prevent_initial_call='initial_duplicate',
 )
 def populate_filters_adaptive(
-    proc_status,
-    year_from, year_to,
-    sources, companies, products, actions, sentiment
+    proc_status, period_mode,
+    year_from, year_to, years_multi, months_multi,
+    sources, companies, products, actions, sentiment, active_tab
 ):
-    empty = ([], [], [], [], [], [])
+    empty = ([], [], [], [], [], [], [])
 
     if not os.path.exists(TARGET_DB_PATH):
         return empty
@@ -704,14 +970,7 @@ def populate_filters_adaptive(
 
     # Construir el dict de filtros activos con el mismo formato
     # que usa _build_dynamic_query, tal como lo hace update_view()
-    active_filters = {}
-
-    if year_from is not None and year_to is not None:
-        active_filters["period"] = [int(year_from), int(year_to)]
-    elif year_from is not None:
-        active_filters["period"] = [int(year_from), 2027]
-    elif year_to is not None:
-        active_filters["period"] = [2010, int(year_to)]
+    active_filters = _build_period_filters(period_mode, year_from, year_to, years_multi, months_multi)
 
     if sources:
         active_filters["sources"] = sources if isinstance(sources, list) else [sources]
@@ -734,8 +993,13 @@ def populate_filters_adaptive(
         print(f"[populate_filters_adaptive] Error: {e}")
         return empty
 
-    # Para year-from: mostrar todos los años disponibles,
-    # pero deshabilitar los que sean mayores al year_to seleccionado
+    # Restringir plataformas a las relevantes de la pestaña activa
+    allowed_sources = TAB_FILTER_CONFIG.get(active_tab, {}).get("sources")
+    source_opts = opts["sources"]
+    if allowed_sources is not None:
+        source_opts = [o for o in source_opts if o["value"] in allowed_sources]
+
+    # Para year-from: deshabilitar los mayores al year_to seleccionado
     year_from_opts = [
         {**o, "disabled": (year_to is not None and o["value"] > year_to)}
         for o in opts["years"]
@@ -746,13 +1010,17 @@ def populate_filters_adaptive(
         for o in opts["years"]
     ]
 
+    # Casillas de años: años realmente presentes en la DB
+    years_multi_opts = [{"label": o["label"], "value": o["value"]} for o in opts["years"]]
+
     return (
-        opts["sources"],
+        source_opts,
         opts["companies"],
         opts["products"],
         opts["actions"],
         year_from_opts,
         year_to_opts,
+        years_multi_opts,
     )
 
 
@@ -773,9 +1041,41 @@ def toggle_datasets_modal(n_open, n_close, is_open):
     Output("datasets-modal-body", "children"),
     Input("datasets-modal", "is_open"),
     Input("dataset-refresh", "data"),
+    Input("processing-status", "data"),
 )
-def render_datasets_modal_body(is_open, refresh):
-    return _build_datasets_checklist(get_datasets())
+def render_datasets_modal_body(is_open, refresh, proc_status):
+    # Reconciliar antes de listar, para reflejar el estado real de la DB
+    try:
+        reconcile_datasets()
+    except Exception as e:
+        print(f"[render_datasets_modal_body] reconcile: {e}")
+
+    children = [
+        html.Div([
+            html.I(className="bi bi-database me-2", style={"color": COLOR_ACCENT}),
+            html.Span("Datasets cargados", style={
+                "fontWeight": "700", "fontSize": "0.72rem", "letterSpacing": "0.08em",
+                "textTransform": "uppercase", "color": COLOR_NEUTRAL_2,
+            }),
+        ], style={"marginBottom": "6px"}),
+        _build_datasets_checklist(get_datasets()),
+    ]
+
+    if proc_status and proc_status.get("status") == "processing":
+        children.append(html.Div([
+            dbc.Spinner(size="sm", color="primary", spinner_class_name="me-2"),
+            html.Span("Importando dataset…", style={"fontSize": "0.82rem", "color": COLOR_PRIMARY}),
+        ], style={"marginTop": "14px"}))
+
+    try:
+        available_section = _build_available_section(scan_available_datasets())
+    except Exception as e:
+        print(f"[render_datasets_modal_body] scan: {e}")
+        available_section = None
+    if available_section is not None:
+        children.append(available_section)
+
+    return html.Div(children)
 
 
 @app.callback(
@@ -870,6 +1170,36 @@ def _bg_process(dataset_name: str):
     except Exception as e:
         with open("etl_status.txt", "w", encoding="utf-8") as f:
             f.write(f"error: {e}")
+
+
+def _bg_process_local(path: str, dataset_name: str):
+    try:
+        process_local_file(path, dataset_name)
+        clear_cache()
+        with open("etl_status.txt", "w", encoding="utf-8") as f:
+            f.write("success")
+    except Exception as e:
+        with open("etl_status.txt", "w", encoding="utf-8") as f:
+            f.write(f"error: {e}")
+
+
+@app.callback(
+    Output("processing-status", "data", allow_duplicate=True),
+    Input({"type": "btn-import-available", "index": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def import_available_dataset(n_clicks_list):
+    if not n_clicks_list or not any(n_clicks_list):
+        return dash.no_update
+    triggered = ctx.triggered_id
+    if not triggered or not isinstance(triggered, dict):
+        return dash.no_update
+    path = triggered.get("index")
+    if not path or not os.path.isfile(path):
+        return dash.no_update
+    dataset_name = os.path.splitext(os.path.basename(path))[0]
+    threading.Thread(target=_bg_process_local, args=(path, dataset_name)).start()
+    return {"status": "processing"}
 
 
 @app.callback(

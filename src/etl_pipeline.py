@@ -295,3 +295,142 @@ def process_zip_file(dataset_name: str = "Dataset") -> None:
 
         df_processed = _transform_and_clean(df_raw)
         _load_to_sqlite(df_processed, dataset_name)
+
+
+# ── Auto-descubrimiento, carga de archivos sueltos y reconciliación ─────────────
+
+def _load_db_file(src_path: str, dataset_name: str) -> bool:
+    """Lee client_signals de un .db suelto y lo agrega acumulativamente."""
+    with sqlite3.connect(src_path) as src_conn:
+        tables = [
+            r[0] for r in src_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        ]
+        if 'client_signals' not in tables:
+            return False
+        count = src_conn.execute("SELECT COUNT(*) FROM client_signals").fetchone()[0]
+        if count == 0:
+            return False
+        col_info = src_conn.execute("PRAGMA table_info(client_signals)").fetchall()
+        existing_cols = {row[1] for row in col_info}
+        readable_cols = [c for c in REQUIRED_COLUMNS if c in existing_cols]
+        if not readable_cols:
+            return False
+        col_str = ", ".join(readable_cols)
+        rows = src_conn.execute(f"SELECT {col_str} FROM client_signals").fetchall()
+        col_data = {col: [row[i] for row in rows] for i, col in enumerate(readable_cols)}
+        df = pl.DataFrame(col_data)
+    _load_to_sqlite(df, dataset_name)
+    return True
+
+
+def process_local_file(path: str, dataset_name: str = None) -> None:
+    """Carga acumulativa de un archivo suelto (.zip/.csv/.parquet/.jsonl/.json/.db)."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Archivo no encontrado: {path}")
+    ext = os.path.splitext(path)[1].lower()
+    if dataset_name is None:
+        dataset_name = os.path.splitext(os.path.basename(path))[0]
+
+    if ext == '.zip':
+        cleanup_staging()
+        shutil.copy2(path, UPLOADED_ZIP_PATH)
+        process_zip_file(dataset_name)
+        return
+
+    if ext == '.db':
+        if not _load_db_file(path, dataset_name):
+            raise ValueError(f"El archivo '{os.path.basename(path)}' no contiene una tabla 'client_signals' con datos.")
+        return
+
+    if ext in _VALID_EXTENSIONS:
+        df_raw = _route_to_reader(path)
+        if df_raw.height == 0:
+            raise ValueError(f"El archivo '{os.path.basename(path)}' está vacío.")
+        df_processed = _transform_and_clean(df_raw)
+        _load_to_sqlite(df_processed, dataset_name)
+        return
+
+    raise ValueError(f"Formato {ext} no soportado.")
+
+
+def scan_available_datasets() -> list:
+    """Escanea STAGING_DIR (recursivo) buscando archivos de datos candidatos.
+
+    Devuelve dicts {name, path, size_bytes, ext, imported}. `imported` compara
+    el stem del archivo contra los nombres ya registrados en la tabla datasets.
+    """
+    if not os.path.exists(STAGING_DIR):
+        return []
+    valid = {'.csv'}
+    imported_names = {d["name"] for d in get_datasets()}
+    results = []
+    for root, _dirs, files in os.walk(STAGING_DIR):
+        for fn in files:
+            if fn.startswith(('.', '__', '~')):
+                continue
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in valid:
+                continue
+            full = os.path.join(root, fn)
+            stem = os.path.splitext(fn)[0]
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            results.append({
+                "name": fn,
+                "path": full,
+                "size_bytes": size,
+                "ext": ext,
+                "imported": stem in imported_names,
+            })
+    results.sort(key=lambda r: r["name"].lower())
+    return results
+
+
+def reconcile_datasets() -> None:
+    """Repara desincronizaciones entre client_signals y la tabla datasets.
+
+    - Asigna un dataset 'recuperado' a las filas con dataset_id NULL.
+    - Crea filas de registro para dataset_id huérfanos (sin fila en datasets).
+    Idempotente: correrla varias veces no duplica registros.
+    """
+    if not os.path.exists(TARGET_DB_PATH):
+        return
+    conn = sqlite3.connect(TARGET_DB_PATH)
+    try:
+        cur = conn.cursor()
+        _ensure_datasets_schema(cur)
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        null_count = cur.execute(
+            "SELECT COUNT(*) FROM client_signals WHERE dataset_id IS NULL"
+        ).fetchone()[0]
+        if null_count > 0:
+            cur.execute(
+                "INSERT INTO datasets (name, loaded_at, row_count) VALUES (?, ?, ?);",
+                ("Datos sin registrar (recuperado)", now, null_count),
+            )
+            new_id = cur.lastrowid
+            cur.execute(
+                "UPDATE client_signals SET dataset_id = ? WHERE dataset_id IS NULL;",
+                (new_id,),
+            )
+
+        orphans = cur.execute("""
+            SELECT cs.dataset_id, COUNT(*)
+            FROM client_signals cs
+            LEFT JOIN datasets d ON cs.dataset_id = d.id
+            WHERE cs.dataset_id IS NOT NULL AND d.id IS NULL
+            GROUP BY cs.dataset_id
+        """).fetchall()
+        for did, cnt in orphans:
+            cur.execute(
+                "INSERT INTO datasets (id, name, loaded_at, row_count) VALUES (?, ?, ?, ?);",
+                (did, f"Dataset {did} (recuperado)", now, cnt),
+            )
+        conn.commit()
+    finally:
+        conn.close()
