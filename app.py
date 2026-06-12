@@ -412,7 +412,7 @@ app.layout = html.Div(
         # Sesión de autenticación (client-side, persistente hasta logout explícito).
         dcc.Store(id="auth-session", storage_type="local", data=None),
         dcc.Store(id="available-years-list", data=list(range(2010, 2028))),
-        dcc.Interval(id="status-interval", interval=1000, n_intervals=0),
+        dcc.Interval(id="status-interval", interval=1000, n_intervals=0, disabled=True),
 
         # ── DATASET MANAGEMENT MODAL ───────────────────────────────────────
         dbc.Modal(
@@ -1470,6 +1470,14 @@ def check_processing(n, curr):
             ])
         return {"status": "error"}, dbc.Alert(f"Fallo: {res}", color="danger")
     return dash.no_update, dash.no_update
+
+
+@app.callback(
+    Output("status-interval", "disabled"),
+    Input("processing-status", "data"),
+)
+def toggle_status_interval(status):
+    return (status or {}).get("status") != "processing"
 
 
 # =============================================================================
