@@ -78,6 +78,27 @@ TAB_FILTER_CONFIG = {
     },
 }
 
+# =============================================================================
+# AUTENTICACIÓN — base de usuarios y stakeholders
+# =============================================================================
+# Etiquetas canónicas de cada pestaña (deben coincidir con los tab_id de dbc.Tabs).
+TAB_DEFS = [
+    ("tab-marketing",   "Marketing"),
+    ("tab-dir-general", "Dirección General"),
+    ("tab-retencion",   "Retención y Facturación"),
+    ("tab-producto",    "Equipo de Producto"),
+]
+TAB_LABELS = dict(TAB_DEFS)
+
+# Base de usuarios predefinida. Un stakeholder por usuario; cada uno accede
+# únicamente a su pestaña principal. (Credenciales en claro: entorno demo/educativo.)
+USERS = {
+    "marketing": {"password": "marketing123", "stakeholder": "Marketing",         "tab": "tab-marketing"},
+    "direccion": {"password": "direccion123", "stakeholder": "Dirección General",  "tab": "tab-dir-general"},
+    "retencion": {"password": "retencion123", "stakeholder": "Retención",          "tab": "tab-retencion"},
+    "producto":  {"password": "producto123",  "stakeholder": "Equipo de Producto", "tab": "tab-producto"},
+}
+
 
 def _build_period_filters(mode, year_from, year_to, years_multi, months_multi) -> dict:
     """Traduce el modo de período + selecciones a claves de filtro de query."""
@@ -388,6 +409,8 @@ app.layout = html.Div(
     children=[
         dcc.Store(id="processing-status", data={"status": "ready"}),
         dcc.Store(id="dataset-refresh", data=0),
+        # Sesión de autenticación (client-side, persistente hasta logout explícito).
+        dcc.Store(id="auth-session", storage_type="local", data=None),
         dcc.Store(id="available-years-list", data=list(range(2010, 2028))),
         dcc.Interval(id="status-interval", interval=1000, n_intervals=0),
 
@@ -433,6 +456,81 @@ app.layout = html.Div(
             ],
         ),
 
+        # ── LOGIN OVERLAY ─────────────────────────────────────────────────
+        # Visible por defecto; el callback `render_auth_gate` lo oculta si hay
+        # una sesión activa restaurada desde el almacenamiento del navegador.
+        html.Div(
+            id="login-overlay",
+            style=_OVERLAY_VISIBLE,
+            children=[
+                dbc.Card(
+                    style={"width": "420px", "borderRadius": "20px", "border": "none", "overflow": "hidden"},
+                    className="shadow-lg",
+                    children=[
+                        html.Div(
+                            style={
+                                "background": f"linear-gradient(135deg, {COLOR_PRIMARY} 0%, {COLOR_ACCENT} 100%)",
+                                "padding": "34px 32px", "textAlign": "center",
+                            },
+                            children=[
+                                html.Div(
+                                    "DV",
+                                    style={
+                                        "display": "inline-flex", "alignItems": "center",
+                                        "justifyContent": "center", "width": "44px", "height": "44px",
+                                        "backgroundColor": "rgba(255,255,255,0.15)",
+                                        "borderRadius": "10px", "fontWeight": "800",
+                                        "fontSize": "16px", "color": "#FFFFFF",
+                                        "marginBottom": "14px", "fontFamily": FONT_MONO,
+                                        "letterSpacing": "-0.01em",
+                                    },
+                                ),
+                                html.Div([
+                                    html.Span("Dash", style={
+                                        "fontWeight": "300", "color": "rgba(255,255,255,0.85)",
+                                        "fontSize": "2.4rem", "letterSpacing": "-0.02em",
+                                    }),
+                                    html.Span("View", style={
+                                        "fontWeight": "800", "color": "#FFFFFF",
+                                        "fontSize": "2.4rem", "letterSpacing": "-0.04em",
+                                    }),
+                                ]),
+                                html.P(
+                                    "Acceso a la plataforma",
+                                    style={"color": "rgba(255,255,255,0.65)", "marginBottom": "0",
+                                           "fontSize": "0.8rem", "letterSpacing": "0.08em",
+                                           "textTransform": "uppercase"},
+                                ),
+                            ],
+                        ),
+                        dbc.CardBody([
+                            dbc.Label("Usuario", html_for="login-username", style=STYLE_FILTER_LABEL),
+                            dbc.Input(
+                                id="login-username", type="text", placeholder="usuario",
+                                autoFocus=True, n_submit=0,
+                                style={"fontSize": "14px", "marginBottom": "16px"},
+                            ),
+                            dbc.Label("Contraseña", html_for="login-password", style=STYLE_FILTER_LABEL),
+                            dbc.Input(
+                                id="login-password", type="password", placeholder="••••••••",
+                                n_submit=0,
+                                style={"fontSize": "14px", "marginBottom": "20px"},
+                            ),
+                            dbc.Button(
+                                [html.I(className="bi bi-box-arrow-in-right me-2"), "Ingresar"],
+                                id="btn-login", color="primary", className="w-100",
+                                style={"fontWeight": "600", "letterSpacing": "0.03em", "borderRadius": "10px"},
+                            ),
+                            html.Div(id="login-error", className="mt-3"),
+                        ], style={"padding": "28px"}),
+                    ],
+                )
+            ],
+        ),
+
+        # ── ÁREA AUTENTICADA (dashboard + overlay de carga) ───────────────
+        html.Div(id="authenticated-area", style={"display": "none"}, children=[
+
         # ── MAIN DASHBOARD ────────────────────────────────────────────────
         html.Div(
             id="main-dashboard-container",
@@ -472,6 +570,23 @@ app.layout = html.Div(
                         dbc.Button(
                             [html.I(className="bi bi-cloud-upload me-2"), "Importar Datos"],
                             id="btn-load-new", color="light", size="sm", className="ms-2",
+                            style={
+                                "fontWeight": "600", "fontSize": "0.78rem",
+                                "letterSpacing": "0.05em", "borderRadius": "8px",
+                            },
+                        ),
+                        # ── Identidad del stakeholder + logout ──────────────
+                        html.Span(
+                            id="navbar-user-label",
+                            className="ms-3 d-none d-md-inline-flex align-items-center",
+                            style={
+                                "color": "rgba(255,255,255,0.92)", "fontSize": "0.78rem",
+                                "fontWeight": "600", "letterSpacing": "0.03em",
+                            },
+                        ),
+                        dbc.Button(
+                            [html.I(className="bi bi-box-arrow-right me-2"), "Salir"],
+                            id="btn-logout", color="light", outline=True, size="sm", className="ms-2",
                             style={
                                 "fontWeight": "600", "fontSize": "0.78rem",
                                 "letterSpacing": "0.05em", "borderRadius": "8px",
@@ -750,12 +865,91 @@ app.layout = html.Div(
                 )
             ],
         ),
+
+        ]),  # ── fin ÁREA AUTENTICADA ──────────────────────────────────────
     ],
 )
 
 # =============================================================================
 # CALLBACKS
 # =============================================================================
+
+# ── AUTENTICACIÓN ────────────────────────────────────────────────────────────
+@app.callback(
+    Output("login-overlay", "style"),
+    Output("authenticated-area", "style"),
+    Input("auth-session", "data"),
+)
+def render_auth_gate(session):
+    """Muestra el dashboard si hay sesión activa; si no, el formulario de login."""
+    if session and session.get("user"):
+        return {"display": "none"}, {"display": "block"}
+    return _OVERLAY_VISIBLE, {"display": "none"}
+
+
+@app.callback(
+    Output("tabs-stakeholders", "children"),
+    Output("tabs-stakeholders", "active_tab"),
+    Output("navbar-user-label", "children"),
+    Input("auth-session", "data"),
+)
+def render_allowed_tabs(session):
+    """Expone ÚNICAMENTE la pestaña principal del stakeholder autenticado."""
+    if not session or not session.get("user"):
+        return dash.no_update, dash.no_update, ""
+    tab = session["tab"]
+    children = [dbc.Tab(label=TAB_LABELS[tab], tab_id=tab)]
+    label = [
+        html.I(className="bi bi-person-circle me-2"),
+        html.Span(session["stakeholder"], style={"fontWeight": "700"}),
+        html.Span(f"  ·  {session['user']}", style={"opacity": "0.7", "fontWeight": "500"}),
+    ]
+    return children, tab, label
+
+
+@app.callback(
+    Output("auth-session", "data"),
+    Output("login-error", "children"),
+    Input("btn-login", "n_clicks"),
+    Input("login-username", "n_submit"),
+    Input("login-password", "n_submit"),
+    State("login-username", "value"),
+    State("login-password", "value"),
+    prevent_initial_call=True,
+)
+def do_login(n_clicks, n_submit_user, n_submit_pass, username, password):
+    """Valida credenciales contra la base de usuarios predefinida."""
+    if not (n_clicks or n_submit_user or n_submit_pass):
+        raise dash.exceptions.PreventUpdate
+    username = (username or "").strip().lower()
+    user = USERS.get(username)
+    if user and password == user["password"]:
+        return (
+            {"user": username, "stakeholder": user["stakeholder"], "tab": user["tab"]},
+            "",
+        )
+    error = dbc.Alert(
+        [html.I(className="bi bi-exclamation-triangle-fill me-2"), "Usuario o contraseña incorrectos."],
+        color="danger", className="mb-0 py-2",
+        style={"fontSize": "0.82rem", "borderRadius": "10px"},
+    )
+    return dash.no_update, error
+
+
+@app.callback(
+    Output("auth-session", "data", allow_duplicate=True),
+    Output("login-username", "value"),
+    Output("login-password", "value"),
+    Output("login-error", "children", allow_duplicate=True),
+    Input("btn-logout", "n_clicks"),
+    prevent_initial_call=True,
+)
+def do_logout(n):
+    """Cierra la sesión: borra el cache client-side y vuelve al login."""
+    if not n:
+        raise dash.exceptions.PreventUpdate
+    return None, "", "", ""
+
 
 @app.callback(
     Output("filter-year-to", "options"),
