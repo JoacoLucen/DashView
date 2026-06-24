@@ -24,9 +24,10 @@ from src.metrics import (
 )
 from src.etl_pipeline import (
     TARGET_DB_PATH, STAGING_DIR, EXTRACTED_DIR, UPLOADED_ZIP_PATH,
-    cleanup_staging, process_zip_file, process_local_file,
+    cleanup_staging, process_zip_file,
     get_datasets, delete_dataset, delete_all_datasets,
-    scan_available_datasets, reconcile_datasets,
+    reconcile_datasets,
+    DuplicateDatasetError,
 )
 
 # =============================================================================
@@ -321,60 +322,6 @@ def _build_datasets_checklist(datasets: list):
         },
         inputStyle={"marginRight": "10px", "accentColor": COLOR_PRIMARY, "cursor": "pointer"},
     )
-
-
-def _human_size(num_bytes: int) -> str:
-    size = float(num_bytes or 0)
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} GB"
-
-
-def _build_available_section(available: list):
-    """Sección 'Disponibles para importar' del modal: archivos detectados en staging."""
-    pending = [a for a in available if not a["imported"]]
-    if not pending:
-        return None
-    rows = []
-    for item in pending:
-        rows.append(html.Div(
-            [
-                html.Div([
-                    html.I(className="bi bi-file-earmark-arrow-down me-2", style={"color": COLOR_ACCENT}),
-                    html.Span(item["name"], style={"fontWeight": "600", "fontSize": "0.85rem", "color": COLOR_NEUTRAL_DARK}),
-                    html.Span(
-                        f"  ·  {item['ext'][1:].upper()}  ·  {_human_size(item['size_bytes'])}",
-                        style={"fontSize": "0.75rem", "color": COLOR_NEUTRAL_2},
-                    ),
-                ], style={"flex": "1", "minWidth": "0", "overflow": "hidden", "textOverflow": "ellipsis", "whiteSpace": "nowrap"}),
-                dbc.Button(
-                    [html.I(className="bi bi-download me-1"), "Importar"],
-                    id={"type": "btn-import-available", "index": item["path"]},
-                    color="primary", outline=True, size="sm", n_clicks=0,
-                    style={"fontSize": "0.72rem", "fontWeight": "600", "flexShrink": "0"},
-                ),
-            ],
-            style={
-                "display": "flex", "alignItems": "center", "gap": "10px",
-                "padding": "10px 4px", "borderBottom": f"1px solid {COLOR_BORDER}",
-            },
-        ))
-    return html.Div([
-        html.Div([
-            html.I(className="bi bi-folder2-open me-2", style={"color": COLOR_ACCENT}),
-            html.Span("Disponibles para importar", style={
-                "fontWeight": "700", "fontSize": "0.72rem", "letterSpacing": "0.08em",
-                "textTransform": "uppercase", "color": COLOR_NEUTRAL_2,
-            }),
-        ], style={"marginTop": "18px", "marginBottom": "6px"}),
-        html.P(
-            "Archivos detectados en data/staging que aún no fueron importados. La carga es acumulativa.",
-            style={"fontSize": "0.74rem", "color": COLOR_NEUTRAL_2, "marginBottom": "8px"},
-        ),
-        html.Div(rows),
-    ])
 
 
 # =============================================================================
@@ -775,54 +722,23 @@ app.layout = html.Div(
             ],
         ),
 
-        # ── WELCOME OVERLAY ────────────────────────────────────────────────
-        html.Div(
-            id="welcome-overlay",
-            style=_OVERLAY_VISIBLE if not os.path.exists(TARGET_DB_PATH) else {"display": "none"},
+        # ── IMPORT DATA MODAL ──────────────────────────────────────────────
+        # Modal flotante sobre el dashboard (con X para cerrar). Se abre con el
+        # botón "Importar Datos" y, en primer arranque, si todavía no hay datos.
+        dbc.Modal(
+            id="import-modal",
+            is_open=not os.path.exists(TARGET_DB_PATH),
+            size="md",
+            centered=True,
             children=[
-                dbc.Card(
-                    style={"width": "480px", "borderRadius": "20px", "border": "none", "overflow": "hidden"},
-                    className="shadow-lg",
-                    children=[
-                        html.Div(
-                            className="overlay-header",
-                            style={
-                                "background": f"linear-gradient(135deg, {COLOR_PRIMARY} 0%, {COLOR_ACCENT} 100%)",
-                                "padding": "36px 32px",
-                                "textAlign": "center",
-                            },
-                            children=[
-                                html.Div(
-                                    "DV",
-                                    style={
-                                        "display": "inline-flex", "alignItems": "center",
-                                        "justifyContent": "center", "width": "44px", "height": "44px",
-                                        "backgroundColor": "rgba(255,255,255,0.15)",
-                                        "borderRadius": "10px", "fontWeight": "800",
-                                        "fontSize": "16px", "color": "#FFFFFF",
-                                        "marginBottom": "14px", "fontFamily": FONT_MONO,
-                                        "letterSpacing": "-0.01em",
-                                    },
-                                ),
-                                html.Div([
-                                    html.Span("Dash", style={
-                                        "fontWeight": "300", "color": "rgba(255,255,255,0.85)",
-                                        "fontSize": "2.8rem", "letterSpacing": "-0.02em",
-                                    }),
-                                    html.Span("View", style={
-                                        "fontWeight": "800", "color": "#FFFFFF",
-                                        "fontSize": "2.8rem", "letterSpacing": "-0.04em",
-                                    }),
-                                ]),
-                                html.P(
-                                    "Inteligencia de Datos de Clientes",
-                                    style={"color": "rgba(255,255,255,0.65)", "marginBottom": "0",
-                                           "fontSize": "0.85rem", "letterSpacing": "0.08em",
-                                           "textTransform": "uppercase"},
-                                ),
-                            ],
-                        ),
-                        dbc.CardBody([
+                dbc.ModalHeader(
+                    dbc.ModalTitle([
+                        html.I(className="bi bi-cloud-upload me-2", style={"color": COLOR_ACCENT}),
+                        "Importar Datos",
+                    ]),
+                    close_button=True,
+                ),
+                dbc.ModalBody([
                             dcc.Loading(type="circle", color=COLOR_PRIMARY, children=[
                                 dcc.Upload(
                                     id="upload-data-file", accept=".zip",
@@ -860,9 +776,7 @@ app.layout = html.Div(
                             ]),
                             # Existing datasets summary (shown when re-importing)
                             html.Div(id="overlay-datasets-section"),
-                        ], style={"padding": "28px"}),
-                    ],
-                )
+                ], style={"padding": "28px"}),
             ],
         ),
 
@@ -1071,20 +985,18 @@ def prune_filters_on_tab_change(tab, sources, companies, products, actions, sent
 
 
 @app.callback(
-    Output("welcome-overlay", "style", allow_duplicate=True),
-    Output("main-dashboard-container", "style", allow_duplicate=True),
+    Output("import-modal", "is_open", allow_duplicate=True),
     Input("btn-load-new", "n_clicks"),
     prevent_initial_call=True,
 )
-def show_import_overlay(n):
+def show_import_modal(n):
     if n:
-        return _OVERLAY_VISIBLE, {"display": "none"}
-    return dash.no_update, dash.no_update
+        return True
+    return dash.no_update
 
 
 @app.callback(
     Output("tab-content-container", "children"),
-    Output("welcome-overlay", "style", allow_duplicate=True),
     Output("main-dashboard-container", "style", allow_duplicate=True),
     Input("tabs-stakeholders", "active_tab"),
     Input("filter-year-from", "value"),
@@ -1103,9 +1015,9 @@ def show_import_overlay(n):
 def update_view(tab, year_from, year_to, period_mode, years_multi, months_multi,
                 sources, companies, products, actions, sentiment, proc_status):
     if not os.path.exists(TARGET_DB_PATH):
-        return html.Div(), dash.no_update, {"display": "none"}
+        return html.Div(), {"display": "none"}
     if proc_status.get("status") == "processing":
-        return dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update
 
     filters = {
         "sources": sources, "companies": companies, "products": products,
@@ -1119,11 +1031,10 @@ def update_view(tab, year_from, year_to, period_mode, years_multi, months_multi,
         elif tab == "tab-retencion":    view = render_retention(filters)
         elif tab == "tab-producto":     view = render_product_team(filters)
         else:                           view = html.Div()
-        return view, {"display": "none"}, {"display": "block"}
+        return view, {"display": "block"}
     except Exception as e:
         return (
             html.Div(dbc.Alert(f"Aviso del Sistema: {e}", color="warning")),
-            {"display": "none"},
             {"display": "block"},
         )
 
@@ -1261,14 +1172,6 @@ def render_datasets_modal_body(is_open, refresh, proc_status):
             html.Span("Importando dataset…", style={"fontSize": "0.82rem", "color": COLOR_PRIMARY}),
         ], style={"marginTop": "14px"}))
 
-    try:
-        available_section = _build_available_section(scan_available_datasets())
-    except Exception as e:
-        print(f"[render_datasets_modal_body] scan: {e}")
-        available_section = None
-    if available_section is not None:
-        children.append(available_section)
-
     return html.Div(children)
 
 
@@ -1316,7 +1219,7 @@ def render_overlay_datasets(refresh, proc_status):
 @app.callback(
     Output("dataset-refresh", "data"),
     Output("processing-status", "data", allow_duplicate=True),
-    Output("welcome-overlay", "style", allow_duplicate=True),
+    Output("import-modal", "is_open", allow_duplicate=True),
     Output("main-dashboard-container", "style", allow_duplicate=True),
     Input("btn-delete-selected", "n_clicks"),
     Input("btn-delete-all-datasets", "n_clicks"),
@@ -1346,7 +1249,7 @@ def handle_dataset_deletion(n_sel, n_all, selected_ids, refresh_count):
     if not remaining:
         if os.path.exists(TARGET_DB_PATH):
             os.remove(TARGET_DB_PATH)
-        return new_count, {"status": "ready"}, _OVERLAY_VISIBLE, {"display": "none"}
+        return new_count, {"status": "ready"}, True, {"display": "none"}
 
     return new_count, {"status": "ready"}, dash.no_update, dash.no_update
 
@@ -1355,45 +1258,20 @@ def handle_dataset_deletion(n_sel, n_all, selected_ids, refresh_count):
 # ETL BACKGROUND
 # =============================================================================
 
+def _write_etl_status(text: str):
+    with open("etl_status.txt", "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def _bg_process(dataset_name: str):
     try:
         process_zip_file(dataset_name)
         clear_cache()
-        with open("etl_status.txt", "w", encoding="utf-8") as f:
-            f.write("success")
+        _write_etl_status("success")
+    except DuplicateDatasetError as e:
+        _write_etl_status(f"duplicate: {e}")
     except Exception as e:
-        with open("etl_status.txt", "w", encoding="utf-8") as f:
-            f.write(f"error: {e}")
-
-
-def _bg_process_local(path: str, dataset_name: str):
-    try:
-        process_local_file(path, dataset_name)
-        clear_cache()
-        with open("etl_status.txt", "w", encoding="utf-8") as f:
-            f.write("success")
-    except Exception as e:
-        with open("etl_status.txt", "w", encoding="utf-8") as f:
-            f.write(f"error: {e}")
-
-
-@app.callback(
-    Output("processing-status", "data", allow_duplicate=True),
-    Input({"type": "btn-import-available", "index": ALL}, "n_clicks"),
-    prevent_initial_call=True,
-)
-def import_available_dataset(n_clicks_list):
-    if not n_clicks_list or not any(n_clicks_list):
-        return dash.no_update
-    triggered = ctx.triggered_id
-    if not triggered or not isinstance(triggered, dict):
-        return dash.no_update
-    path = triggered.get("index")
-    if not path or not os.path.isfile(path):
-        return dash.no_update
-    dataset_name = os.path.splitext(os.path.basename(path))[0]
-    threading.Thread(target=_bg_process_local, args=(path, dataset_name)).start()
-    return {"status": "processing"}
+        _write_etl_status(f"error: {e}")
 
 
 @app.callback(
@@ -1452,13 +1330,14 @@ def handle_local_path(n_clicks, path):
 @app.callback(
     Output("processing-status", "data", allow_duplicate=True),
     Output("upload-status-message", "children", allow_duplicate=True),
+    Output("import-modal", "is_open", allow_duplicate=True),
     Input("status-interval", "n_intervals"),
     State("processing-status", "data"),
     prevent_initial_call=True,
 )
 def check_processing(n, curr):
     if curr.get("status") != "processing":
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
     if os.path.exists("etl_status.txt"):
         with open("etl_status.txt", "r", encoding="utf-8") as f:
             res = f.read()
@@ -1467,9 +1346,16 @@ def check_processing(n, curr):
             return {"status": "ready"}, html.Span([
                 html.I(className="bi bi-check-circle-fill me-2", style={"color": COLOR_SUCCESS}),
                 "¡Datos cargados exitosamente!",
-            ])
-        return {"status": "error"}, dbc.Alert(f"Fallo: {res}", color="danger")
-    return dash.no_update, dash.no_update
+            ]), False
+        if res.startswith("duplicate:"):
+            msg = res[len("duplicate:"):].strip()
+            return {"status": "ready"}, dbc.Alert(
+                [html.I(className="bi bi-files me-2"), msg],
+                color="warning", className="mb-0",
+                style={"fontSize": "0.85rem", "borderRadius": "10px"},
+            ), dash.no_update
+        return {"status": "error"}, dbc.Alert(f"Fallo: {res}", color="danger"), dash.no_update
+    return dash.no_update, dash.no_update, dash.no_update
 
 
 @app.callback(

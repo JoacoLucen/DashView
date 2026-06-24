@@ -4,7 +4,13 @@ import glob
 import zipfile
 import shutil
 import datetime
+import hashlib
 import polars as pl
+
+
+class DuplicateDatasetError(Exception):
+    """Se intentó cargar un dataset cuyo contenido ya existe en la base."""
+    pass
 
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 TARGET_DB_PATH = os.path.join(_current_dir, "..", "data", "dashview.db")
@@ -118,9 +124,15 @@ def _ensure_datasets_schema(cursor: sqlite3.Cursor) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             loaded_at TEXT NOT NULL,
-            row_count INTEGER NOT NULL
+            row_count INTEGER NOT NULL,
+            content_hash TEXT
         );
     """)
+    # Migración para DBs existentes que no tienen la columna content_hash
+    try:
+        cursor.execute("ALTER TABLE datasets ADD COLUMN content_hash TEXT;")
+    except Exception:
+        pass
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS client_signals (
             dataset_id INTEGER,
@@ -140,6 +152,51 @@ def _ensure_datasets_schema(cursor: sqlite3.Cursor) -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_product ON client_signals (product_service);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_action ON client_signals (customer_action);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sentiment ON client_signals (sentiment_label);")
+
+
+# ── Detección de duplicados ────────────────────────────────────────────────────
+
+def _compute_content_hash(df: pl.DataFrame) -> str:
+    """Huella de contenido independiente del orden de las filas.
+
+    Hashea cada fila, ordena los hashes y los combina en un SHA-256. Dos cargas
+    con las mismas filas (aunque vengan reordenadas o con otro nombre de archivo)
+    producen la misma huella.
+    """
+    if df.height == 0:
+        return ""
+    row_hashes = df.hash_rows(seed=0x44617368).sort()
+    digest = hashlib.sha256()
+    for h in row_hashes.to_list():
+        digest.update(int(h).to_bytes(8, "little"))
+    return digest.hexdigest()
+
+
+def find_duplicate_dataset(content_hash: str):
+    """Devuelve el dataset existente con esa huella, o None si no hay coincidencia."""
+    if not content_hash or not os.path.exists(TARGET_DB_PATH):
+        return None
+    try:
+        conn = sqlite3.connect(TARGET_DB_PATH)
+        try:
+            has_col = any(
+                r[1] == "content_hash"
+                for r in conn.execute("PRAGMA table_info(datasets)").fetchall()
+            )
+            if not has_col:
+                return None
+            row = conn.execute(
+                "SELECT id, name, loaded_at, row_count FROM datasets "
+                "WHERE content_hash = ? LIMIT 1;",
+                (content_hash,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return {"id": row[0], "name": row[1], "loaded_at": row[2], "row_count": row[3]}
 
 
 # ── Public dataset management API ─────────────────────────────────────────────
@@ -189,6 +246,15 @@ def delete_all_datasets() -> None:
 # ── Core load (accumulative) ───────────────────────────────────────────────────
 
 def _load_to_sqlite(df: pl.DataFrame, dataset_name: str) -> None:
+    content_hash = _compute_content_hash(df)
+    existing = find_duplicate_dataset(content_hash)
+    if existing:
+        raise DuplicateDatasetError(
+            f"El dataset que estás cargando es idéntico a «{existing['name']}» "
+            f"({existing['row_count']:,} filas), ya importado el "
+            f"{existing['loaded_at'][:10]}. No se cargó de nuevo para evitar duplicados."
+        )
+
     conn = sqlite3.connect(TARGET_DB_PATH)
     cursor = conn.cursor()
     try:
@@ -196,8 +262,8 @@ def _load_to_sqlite(df: pl.DataFrame, dataset_name: str) -> None:
         cursor.execute("BEGIN TRANSACTION;")
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cursor.execute(
-            "INSERT INTO datasets (name, loaded_at, row_count) VALUES (?, ?, ?);",
-            (dataset_name, now, df.height),
+            "INSERT INTO datasets (name, loaded_at, row_count, content_hash) VALUES (?, ?, ?, ?);",
+            (dataset_name, now, df.height, content_hash),
         )
         dataset_id = cursor.lastrowid
         rows = [(dataset_id, *row) for row in df.iter_rows()]
