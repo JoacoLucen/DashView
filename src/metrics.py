@@ -1,10 +1,10 @@
 import sqlite3
-import pandas as pd
+import polars as pl
 
 try:
-    from .database_manager import _execute_query, DB_PATH
+    from .database_manager import _execute_query, DB_PATH, cached_result
 except ImportError:
-    from src.database_manager import _execute_query, DB_PATH
+    from src.database_manager import _execute_query, DB_PATH, cached_result
 
 
 # =========================================================================
@@ -21,16 +21,16 @@ def get_nps_proxy(filters: dict) -> dict:
         FROM client_signals
     """
     df = _execute_query(query, filters)
-    total = int(df["total"].iloc[0]) if not df.empty else 0
-    promoters = int(df["promoters"].iloc[0] or 0) if not df.empty else 0
-    detractors = int(df["detractors"].iloc[0] or 0) if not df.empty else 0
+    total = int(df["total"][0] or 0) if not df.is_empty() else 0
+    promoters = int(df["promoters"][0] or 0) if not df.is_empty() else 0
+    detractors = int(df["detractors"][0] or 0) if not df.is_empty() else 0
     passives = max(0, total - promoters - detractors)
 
     pct_p = round(promoters / total * 100, 1) if total else 0.0
     pct_d = round(detractors / total * 100, 1) if total else 0.0
     nps = round(pct_p - pct_d, 1)
 
-    breakdown_df = pd.DataFrame({
+    breakdown_df = pl.DataFrame({
         "Segmento": ["Promotores", "Pasivos", "Detractores"],
         "Cantidad": [promoters, passives, detractors],
     })
@@ -43,7 +43,7 @@ def get_nps_proxy(filters: dict) -> dict:
     }
 
 
-def get_complaint_velocity(filters: dict) -> pd.DataFrame:
+def get_complaint_velocity(filters: dict) -> pl.DataFrame:
     """Volumen trimestral de quejas y deserciones — detecta tendencias de empeoramiento."""
     query = """
         SELECT
@@ -64,12 +64,14 @@ def get_complaint_velocity(filters: dict) -> pd.DataFrame:
         ORDER BY year, quarter
     """
     df = _execute_query(query, filters)
-    if not df.empty:
-        df["periodo"] = df["year"].astype(str) + " " + df["quarter"]
+    if not df.is_empty():
+        df = df.with_columns(
+            (pl.col("year").cast(pl.Utf8) + pl.lit(" ") + pl.col("quarter")).alias("periodo")
+        )
     return df
 
 
-def get_sentiment_by_channel(filters: dict) -> pd.DataFrame:
+def get_sentiment_by_channel(filters: dict) -> pl.DataFrame:
     query = """
         SELECT source, AVG(sentiment_score) as avg_sentiment
         FROM client_signals
@@ -80,7 +82,7 @@ def get_sentiment_by_channel(filters: dict) -> pd.DataFrame:
     return _execute_query(query, filters)
 
 
-def get_monthly_activity_peaks(filters: dict) -> pd.DataFrame:
+def get_monthly_activity_peaks(filters: dict) -> pl.DataFrame:
     query = "SELECT month, COUNT(*) as volumen FROM client_signals GROUP BY month ORDER BY month ASC"
     df = _execute_query(query, filters)
     meses_map = {
@@ -88,13 +90,15 @@ def get_monthly_activity_peaks(filters: dict) -> pd.DataFrame:
         5: "May", 6: "Jun", 7: "Jul", 8: "Ago",
         9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"
     }
-    if not df.empty:
-        df["month"] = pd.to_numeric(df["month"], errors="coerce")
-        df["mes_label"] = df["month"].map(meses_map)
+    if not df.is_empty():
+        df = df.with_columns(pl.col("month").cast(pl.Int64, strict=False).alias("month"))
+        df = df.with_columns(
+            pl.col("month").replace_strict(meses_map, default=None).alias("mes_label")
+        )
     return df
 
 
-def get_source_impact(filters: dict) -> pd.DataFrame:
+def get_source_impact(filters: dict) -> pl.DataFrame:
     query = """
         SELECT
             source,
@@ -118,18 +122,30 @@ def get_general_direction_kpis(filters: dict) -> dict:
         GROUP BY customer_action
     """
     df = _execute_query(query, filters)
-    total_churn = df["cantidad"].sum() if not df.empty else 0
+    total_churn = int(df["cantidad"].sum()) if not df.is_empty() else 0
 
     mapeo_causas = {
         "churning": "Insatisfacción General",
         "churning_due_to_price": "Por Precio",
         "churning_due_to_policy": "Por Política"
     }
-    if not df.empty:
-        df["causa_label"] = df["customer_action"].map(mapeo_causas).fillna(df["customer_action"])
-        df["pct"] = (df["cantidad"] / total_churn * 100).round(1) if total_churn > 0 else 0
+    if not df.is_empty():
+        # replace (no estricto) mantiene el valor original para claves no mapeadas,
+        # equivalente a map(...).fillna(original) en pandas.
+        df = df.with_columns(
+            pl.col("customer_action").replace(mapeo_causas).alias("causa_label")
+        )
+        if total_churn > 0:
+            df = df.with_columns(
+                (pl.col("cantidad") / total_churn * 100).round(1).alias("pct")
+            )
+        else:
+            df = df.with_columns(pl.lit(0).alias("pct"))
     else:
-        df = pd.DataFrame(columns=["customer_action", "cantidad", "causa_label", "pct"])
+        df = pl.DataFrame(schema={
+            "customer_action": pl.Utf8, "cantidad": pl.Int64,
+            "causa_label": pl.Utf8, "pct": pl.Float64,
+        })
 
     return {"total_churn": total_churn, "distribucion": df}
 
@@ -143,15 +159,15 @@ def get_regulatory_exposure(filters: dict) -> dict:
         FROM client_signals
     """
     df = _execute_query(query, filters)
-    if df.empty:
+    if df.is_empty():
         return {"total": 0, "regulatorias": 0, "pct": 0.0}
-    total = int(df["total"].iloc[0] or 0)
-    regulatorias = int(df["regulatorias"].iloc[0] or 0)
+    total = int(df["total"][0] or 0)
+    regulatorias = int(df["regulatorias"][0] or 0)
     pct = round(regulatorias / total * 100, 1) if total else 0.0
     return {"total": total, "regulatorias": regulatorias, "pct": pct}
 
 
-def get_prechurn_signals_trend(filters: dict) -> pd.DataFrame:
+def get_prechurn_signals_trend(filters: dict) -> pl.DataFrame:
     """Señales de alerta temprana por año: búsqueda de alternativas y reacción a cambios."""
     query = """
         SELECT year, COUNT(*) as prechurn
@@ -167,7 +183,7 @@ def get_prechurn_signals_trend(filters: dict) -> pd.DataFrame:
     return _execute_query(query, filters)
 
 
-def get_competitive_benchmark(filters: dict) -> pd.DataFrame:
+def get_competitive_benchmark(filters: dict) -> pl.DataFrame:
     query = """
         SELECT company, AVG(sentiment_score) as avg_sentiment
         FROM client_signals
@@ -180,7 +196,7 @@ def get_competitive_benchmark(filters: dict) -> pd.DataFrame:
     return _execute_query(query, filters)
 
 
-def get_company_product_heatmap(filters: dict) -> pd.DataFrame:
+def get_company_product_heatmap(filters: dict) -> pl.DataFrame:
     query = """
         SELECT company, product_service, AVG(sentiment_score) as avg_sentiment
         FROM client_signals
@@ -189,12 +205,15 @@ def get_company_product_heatmap(filters: dict) -> pd.DataFrame:
         LIMIT 500
     """
     df = _execute_query(query, filters)
-    if not df.empty:
+    if not df.is_empty():
         top_products = (
-            df.groupby("product_service")["avg_sentiment"]
-            .count().sort_values(ascending=False).head(8).index
+            df.group_by("product_service")
+            .agg(pl.col("avg_sentiment").count().alias("cnt"))
+            .sort("cnt", descending=True)
+            .head(8)["product_service"]
+            .to_list()
         )
-        df = df[df["product_service"].isin(top_products)]
+        df = df.filter(pl.col("product_service").is_in(top_products))
     return df
 
 
@@ -210,12 +229,10 @@ def get_escalation_rate(filters: dict) -> float:
         GROUP BY customer_action
     """
     df = _execute_query(query, filters)
-    if not df.empty:
-        df_idx = df.set_index('customer_action').reindex(
-            ['complaining', 'formal_complaint'], fill_value=0
-        )
-        comp = df_idx.loc['complaining', 'cantidad']
-        form = df_idx.loc['formal_complaint', 'cantidad']
+    if not df.is_empty():
+        counts = {row["customer_action"]: row["cantidad"] for row in df.iter_rows(named=True)}
+        comp = counts.get("complaining", 0) or 0
+        form = counts.get("formal_complaint", 0) or 0
         total = comp + form
         if total > 0:
             return round((float(form) / float(total)) * 100, 1)
@@ -234,7 +251,7 @@ def get_average_behavior_cycle(filters: dict) -> float:
         GROUP BY company
     """
     # Aplicar filtros a la query interna antes de envolver en la externa
-    from src.database_manager import _build_dynamic_query, DB_PATH
+    from src.database_manager import _build_dynamic_query, _sql_to_polars
     inner_with_filters, params = _build_dynamic_query(inner_query, filters)
 
     outer_query = f"""
@@ -244,21 +261,17 @@ def get_average_behavior_cycle(filters: dict) -> float:
           AND date_neg IS NOT NULL
           AND date_churn > date_neg
     """
-    import sqlite3
-    import pandas as pd
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("PRAGMA busy_timeout = 5000")
-            df = pd.read_sql_query(outer_query, conn, params=params)
-    except Exception as e:
+        df = _sql_to_polars(outer_query, params)
+    except Exception:
         return 0.0
 
-    if not df.empty and pd.notna(df["avg_days"].iloc[0]):
-        return round(float(df["avg_days"].iloc[0]), 1)
+    if not df.is_empty() and df["avg_days"][0] is not None:
+        return round(float(df["avg_days"][0]), 1)
     return 0.0
 
 
-def get_product_risk_radar(filters: dict) -> pd.DataFrame:
+def get_product_risk_radar(filters: dict) -> pl.DataFrame:
     query = """
         SELECT
             product_service as product,
@@ -269,18 +282,20 @@ def get_product_risk_radar(filters: dict) -> pd.DataFrame:
         GROUP BY product_service
     """
     df = _execute_query(query, filters)
-    if not df.empty:
+    if not df.is_empty():
         max_vol = df["vol"].max() or 1
-        df["norm_vol"] = df["vol"] / max_vol
-        df["score"] = (df["neg_ratio"] * 40) + (df["churn_ratio"] * 40) + (df["norm_vol"] * 20)
-        df["score"] = df["score"].round(1).clip(0, 100)
-        df = df.sort_values(by="score", ascending=False).head(10)
+        df = df.with_columns((pl.col("vol") / max_vol).alias("norm_vol"))
+        df = df.with_columns(
+            ((pl.col("neg_ratio") * 40) + (pl.col("churn_ratio") * 40) + (pl.col("norm_vol") * 20)).alias("score")
+        )
+        df = df.with_columns(pl.col("score").round(1).clip(0, 100).alias("score"))
+        df = df.sort("score", descending=True).head(10)
     else:
-        df = pd.DataFrame(columns=["product", "score", "neg_ratio", "churn_ratio", "vol", "norm_vol"])
-    return df[["product", "score"]]
+        df = pl.DataFrame(schema={"product": pl.Utf8, "score": pl.Float64})
+    return df.select(["product", "score"])
 
 
-def get_complaint_topics(filters: dict) -> pd.DataFrame:
+def get_complaint_topics(filters: dict) -> pl.DataFrame:
     """Categorías de queja usando keywords financieras específicas del dataset."""
     query = "SELECT text FROM client_signals WHERE sentiment_label = 'negative' LIMIT 20000"
     df = _execute_query(query, filters)
@@ -293,8 +308,8 @@ def get_complaint_topics(filters: dict) -> pd.DataFrame:
         "Préstamos / Hipotecas": 0,
         "App / Acceso Digital": 0,
     }
-    if not df.empty:
-        texts = df["text"].astype(str).str.lower().fillna("")
+    if not df.is_empty():
+        texts = df["text"].cast(pl.Utf8).str.to_lowercase().fill_null("")
         topics["Cobros / Cargos Incorrectos"] = int(texts.str.contains(
             r"cobro|cargo|tarifa|interes|recargo|billing|charge|fee|overcharg|interest|payment|factura|price"
         ).sum())
@@ -314,10 +329,12 @@ def get_complaint_topics(filters: dict) -> pd.DataFrame:
             r"app|web|login|password|online|digital|portal|slow|crash|error|bug|glitch"
         ).sum())
 
-    return pd.DataFrame(list(topics.items()), columns=["Topic", "Frecuencia"]).sort_values("Frecuencia", ascending=False)
+    return pl.DataFrame(
+        {"Topic": list(topics.keys()), "Frecuencia": list(topics.values())}
+    ).sort("Frecuencia", descending=True)
 
 
-def get_state_intensity_map(filters: dict) -> pd.DataFrame:
+def get_state_intensity_map(filters: dict) -> pl.DataFrame:
     query = """
         SELECT
             REPLACE(REPLACE(country, 'United States - ', ''), 'United States – ', '') as estado,
@@ -336,7 +353,7 @@ def get_state_intensity_map(filters: dict) -> pd.DataFrame:
 # PESTAÑA 4: EQUIPO DE PRODUCTO / APP
 # =========================================================================
 
-def get_device_usage_comparison(filters: dict) -> pd.DataFrame:
+def get_device_usage_comparison(filters: dict) -> pl.DataFrame:
     has_rating = False
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -365,7 +382,7 @@ def get_device_usage_comparison(filters: dict) -> pd.DataFrame:
     return _execute_query(query, filters)
 
 
-def get_rating_distribution(filters: dict) -> pd.DataFrame:
+def get_rating_distribution(filters: dict) -> pl.DataFrame:
     """Distribución de calificaciones 1–5 estrellas en canales móviles."""
     query = """
         SELECT
@@ -378,17 +395,24 @@ def get_rating_distribution(filters: dict) -> pd.DataFrame:
         ORDER BY estrellas
     """
     df = _execute_query(query, filters)
-    if not df.empty:
-        all_stars = pd.DataFrame({"estrellas": [1, 2, 3, 4, 5]})
-        df = all_stars.merge(df, on="estrellas", how="left").fillna(0)
-        df["cantidad"] = df["cantidad"].astype(int)
-        df["estrella_label"] = df["estrellas"].astype(str) + " ★"
+    if not df.is_empty():
+        all_stars = pl.DataFrame({"estrellas": [1, 2, 3, 4, 5]})
+        df = all_stars.join(
+            df.with_columns(pl.col("estrellas").cast(pl.Int64)),
+            on="estrellas", how="left",
+        )
+        df = df.with_columns(pl.col("cantidad").fill_null(0).cast(pl.Int64))
+        df = df.with_columns(
+            (pl.col("estrellas").cast(pl.Utf8) + pl.lit(" ★")).alias("estrella_label")
+        )
     else:
-        df = pd.DataFrame(columns=["estrellas", "cantidad", "estrella_label"])
+        df = pl.DataFrame(schema={
+            "estrellas": pl.Int64, "cantidad": pl.Int64, "estrella_label": pl.Utf8,
+        })
     return df
 
 
-def get_app_reviews_nlp(filters: dict) -> pd.DataFrame:
+def get_app_reviews_nlp(filters: dict) -> pl.DataFrame:
     query = """
         SELECT text FROM client_signals
         WHERE sentiment_label = 'negative'
@@ -398,17 +422,19 @@ def get_app_reviews_nlp(filters: dict) -> pd.DataFrame:
     df = _execute_query(query, filters)
 
     issues = {"Fallas (Crash)": 0, "Lentitud (Slow)": 0, "Errores (Bugs)": 0, "Acceso (Login)": 0}
-    if not df.empty:
-        texts = df["text"].astype(str).str.lower().fillna("")
+    if not df.is_empty():
+        texts = df["text"].cast(pl.Utf8).str.to_lowercase().fill_null("")
         issues["Fallas (Crash)"]   = int(texts.str.contains(r"crash|crashea|caída|caida|cierra|close|quit").sum())
         issues["Lentitud (Slow)"]  = int(texts.str.contains(r"lento|lentitud|demora|delay|slow|lag").sum())
         issues["Errores (Bugs)"]   = int(texts.str.contains(r"error|falla|bug|glitch|problem").sum())
         issues["Acceso (Login)"]   = int(texts.str.contains(r"login|entrar|password|clave|usuario|access").sum())
 
-    return pd.DataFrame(list(issues.items()), columns=["Problema", "Frecuencia"]).sort_values("Frecuencia", ascending=False)
+    return pl.DataFrame(
+        {"Problema": list(issues.keys()), "Frecuencia": list(issues.values())}
+    ).sort("Frecuencia", descending=True)
 
 
-def get_yoy_volume_and_sentiment(filters: dict) -> pd.DataFrame:
+def get_yoy_volume_and_sentiment(filters: dict) -> pl.DataFrame:
     query = """
         SELECT
             year,
@@ -420,3 +446,22 @@ def get_yoy_volume_and_sentiment(filters: dict) -> pd.DataFrame:
         ORDER BY year ASC
     """
     return _execute_query(query, filters)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cachear el resultado de TODAS las métricas públicas (memoria + disco).
+# Se envuelven acá, al final del módulo, sobre las funciones ya definidas. Como
+# este módulo se ejecuta por completo antes de que app.py importe los nombres,
+# app.py recibe directamente las versiones cacheadas. El caché se invalida al
+# importar/borrar datasets (clear_cache) y cuando cambia el .db (ver database_manager).
+# ─────────────────────────────────────────────────────────────────────────────
+for _metric_name in [
+    "get_nps_proxy", "get_complaint_velocity", "get_sentiment_by_channel",
+    "get_monthly_activity_peaks", "get_source_impact", "get_general_direction_kpis",
+    "get_regulatory_exposure", "get_prechurn_signals_trend", "get_competitive_benchmark",
+    "get_company_product_heatmap", "get_escalation_rate", "get_average_behavior_cycle",
+    "get_product_risk_radar", "get_complaint_topics", "get_state_intensity_map",
+    "get_device_usage_comparison", "get_rating_distribution", "get_app_reviews_nlp",
+    "get_yoy_volume_and_sentiment",
+]:
+    globals()[_metric_name] = cached_result(globals()[_metric_name])

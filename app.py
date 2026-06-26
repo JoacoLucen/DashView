@@ -9,7 +9,7 @@ from dash import dcc, html, Input, Output, State, ctx, ALL
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import plotly.express as px
-import pandas as pd
+import polars as pl
 
 from src.database_manager import _execute_query, clear_cache, get_filter_options
 from src.metrics import (
@@ -127,13 +127,13 @@ def get_data_with_fallback(metric_func, filters, title_base):
     data = metric_func(filters)
     empty = False
 
-    if isinstance(data, pd.DataFrame):
-        empty = data.empty
+    if isinstance(data, pl.DataFrame):
+        empty = data.is_empty()
     elif isinstance(data, dict):
         if "total_signals" in data:
             empty = data["total_signals"] == 0
         elif "distribucion" in data:
-            empty = data["distribucion"].empty
+            empty = data["distribucion"].is_empty()
         else:
             empty = not bool(data)
     elif isinstance(data, (int, float)):
@@ -287,7 +287,7 @@ def apply_corporate_layout(fig, barmode=None, margin=None, hide_x_title=False, h
 def _G(fig, cfg=None):
     """Wrap a Plotly figure in a styled chart-card div."""
     return html.Div(
-        dcc.Graph(figure=fig, config=cfg or {"displayModeBar": False}),
+        dcc.Graph(figure=fig, config=cfg or {"displayModeBar": False, "responsive": True}),
         className="chart-card",
     )
 
@@ -321,6 +321,59 @@ def _build_datasets_checklist(datasets: list):
             "cursor": "pointer",
         },
         inputStyle={"marginRight": "10px", "accentColor": COLOR_PRIMARY, "cursor": "pointer"},
+    )
+
+
+def _processing_indicator(text: str = "Ingestando datos corporativos…", color: str = "primary"):
+    """Indicador visual de operación en curso: rueda que gira + barra animada.
+
+    Se usa tanto al subir/importar un dataset como al eliminarlo, para que el
+    usuario vea que el proceso está corriendo.
+    """
+    return html.Div([
+        html.Div([
+            dbc.Spinner(size="sm", color=color, spinner_class_name="me-2"),
+            html.Span(text, style={"fontSize": "0.9rem"}),
+        ], className="d-flex align-items-center justify-content-center mb-2"),
+        dbc.Progress(value=100, striped=True, animated=True, color=color,
+                     style={"height": "8px", "borderRadius": "6px"}),
+    ])
+
+
+def _has_dataset() -> bool:
+    """Fuente de verdad de 'hay datos cargados': el inventario de datasets."""
+    try:
+        return bool(get_datasets())
+    except Exception:
+        return False
+
+
+def _no_dataset_view() -> html.Div:
+    """Mensaje centrado dentro del dashboard cuando no hay ningún dataset cargado
+    (p. ej. tras eliminar todos). Reemplaza al contenido de los gráficos."""
+    return html.Div(
+        dbc.Card(
+            dbc.CardBody([
+                html.I(className="bi bi-database-x",
+                       style={"fontSize": "2.8rem", "color": COLOR_NEUTRAL_2,
+                              "display": "block", "marginBottom": "16px"}),
+                html.H5("No hay ningún dataset cargado",
+                        style={"color": COLOR_NEUTRAL_DARK, "fontWeight": "700", "marginBottom": "8px"}),
+                html.P("Importá un archivo .ZIP para visualizar el dashboard.",
+                       style={"color": COLOR_NEUTRAL_2, "fontSize": "0.9rem", "marginBottom": "20px"}),
+                dbc.Button(
+                    [html.I(className="bi bi-cloud-upload me-2"), "Importar Datos"],
+                    id="btn-import-from-empty", color="primary",
+                    style={"fontWeight": "600", "borderRadius": "10px"},
+                ),
+            ], style={"textAlign": "center", "padding": "56px 32px"}),
+            style={
+                "maxWidth": "520px", "margin": "56px auto",
+                "borderRadius": "16px", "border": f"1.5px dashed {COLOR_BORDER}",
+                "backgroundColor": "rgba(0,0,0,0.01)",
+            },
+            className="shadow-none",
+        ),
     )
 
 
@@ -376,7 +429,15 @@ app.layout = html.Div(
                     close_button=True,
                 ),
                 dbc.ModalBody(
-                    html.Div(id="datasets-modal-body"),
+                    # dcc.Loading muestra una rueda girando mientras se ejecuta la
+                    # eliminación (callback síncrono) o se refresca la lista.
+                    dcc.Loading(
+                        id="datasets-loading", type="circle", color=COLOR_DANGER,
+                        children=html.Div([
+                            html.Div(id="datasets-modal-body"),
+                            html.Div(id="delete-status", className="mt-2"),
+                        ]),
+                    ),
                     style={"padding": "20px 24px", "maxHeight": "420px", "overflowY": "auto"},
                 ),
                 dbc.ModalFooter(
@@ -481,7 +542,9 @@ app.layout = html.Div(
         # ── MAIN DASHBOARD ────────────────────────────────────────────────
         html.Div(
             id="main-dashboard-container",
-            style={"display": "block" if os.path.exists(TARGET_DB_PATH) else "none"},
+            # Visible siempre que haya sesión; update_view decide si muestra los
+            # gráficos o el mensaje 'sin dataset'.
+            style={"display": "block"},
             children=[
                 dbc.NavbarSimple(
                     brand=html.Span([
@@ -727,7 +790,9 @@ app.layout = html.Div(
         # botón "Importar Datos" y, en primer arranque, si todavía no hay datos.
         dbc.Modal(
             id="import-modal",
-            is_open=not os.path.exists(TARGET_DB_PATH),
+            # Arranca cerrado: la verificación de "¿hay dataset cargado?" se hace
+            # recién después de iniciar sesión (ver check_dataset_after_login).
+            is_open=False,
             size="md",
             centered=True,
             children=[
@@ -780,6 +845,68 @@ app.layout = html.Div(
             ],
         ),
 
+        # ── FIRST-LOAD MODAL ───────────────────────────────────────────────
+        # Modal dedicado que aparece SOLO después de iniciar sesión cuando todavía
+        # no hay ningún dataset cargado. Es independiente del modal "Importar Datos"
+        # del navbar: no usa dcc.Loading (que quedaba trabado al revelarse desde un
+        # contenedor oculto) y no se puede cerrar sin cargar datos (backdrop fijo).
+        dbc.Modal(
+            id="firstload-modal",
+            is_open=False,
+            size="md",
+            centered=True,
+            backdrop="static",
+            keyboard=False,
+            children=[
+                dbc.ModalHeader(
+                    dbc.ModalTitle([
+                        html.I(className="bi bi-database-add me-2", style={"color": COLOR_ACCENT}),
+                        "Cargá un dataset para empezar",
+                    ]),
+                    close_button=False,
+                ),
+                dbc.ModalBody([
+                    html.P(
+                        "Todavía no hay datos cargados. Importá un archivo .ZIP para ver el dashboard.",
+                        style={"fontSize": "13px", "color": COLOR_NEUTRAL_DARK, "marginBottom": "16px"},
+                    ),
+                    dcc.Upload(
+                        id="firstload-upload", accept=".zip",
+                        className="upload-zone",
+                        style={
+                            "width": "100%", "height": "110px", "lineHeight": "110px",
+                            "borderWidth": "2px", "borderStyle": "dashed",
+                            "borderColor": COLOR_BORDER, "borderRadius": "12px",
+                            "backgroundColor": COLOR_NEUTRAL_1, "cursor": "pointer",
+                            "textAlign": "center", "transition": "all 0.2s ease",
+                            "color": COLOR_NEUTRAL_DARK, "fontSize": "14px",
+                        },
+                        children=html.Div([
+                            html.I(className="bi bi-cloud-upload me-2", style={"fontSize": "1.4rem", "color": COLOR_ACCENT, "verticalAlign": "middle"}),
+                            "Arrastrá o clickeá para cargar un ", html.B(".ZIP"),
+                        ]),
+                    ),
+                    html.Hr(style={"margin": "18px 0", "borderColor": COLOR_BORDER}),
+                    html.P("O cargá desde una ruta local (para archivos grandes):",
+                           style={"fontSize": "12px", "color": COLOR_NEUTRAL_DARK, "marginBottom": "8px"}),
+                    dbc.InputGroup([
+                        dbc.Input(
+                            id="firstload-local-path",
+                            placeholder=r"Ej: C:\Users\usuario\Downloads\datos.zip",
+                            type="text", size="sm",
+                            style={"fontSize": "12px"},
+                        ),
+                        dbc.Button("Cargar", id="firstload-btn-local", color="primary", size="sm"),
+                    ], style={"marginBottom": "8px"}),
+                    html.Div(
+                        id="firstload-status",
+                        className="mt-3 fw-semibold text-center",
+                        style={"color": COLOR_PRIMARY, "fontSize": "0.9rem"},
+                    ),
+                ], style={"padding": "28px"}),
+            ],
+        ),
+
         ]),  # ── fin ÁREA AUTENTICADA ──────────────────────────────────────
     ],
 )
@@ -799,6 +926,22 @@ def render_auth_gate(session):
     if session and session.get("user"):
         return {"display": "none"}, {"display": "block"}
     return _OVERLAY_VISIBLE, {"display": "none"}
+
+
+@app.callback(
+    Output("firstload-modal", "is_open"),
+    Input("auth-session", "data"),
+    prevent_initial_call=False,
+)
+def check_dataset_after_login(session):
+    """Al iniciar sesión (o recargar con sesión activa), si no hay datos abre el
+    modal de carga inicial. NO se reabre al eliminar datasets: ese caso muestra el
+    dashboard con el mensaje 'sin dataset' (ver update_view). El cierre tras una
+    carga exitosa lo hace check_processing.
+    """
+    if not session or not session.get("user"):
+        return False
+    return not _has_dataset()
 
 
 @app.callback(
@@ -855,14 +998,18 @@ def do_login(n_clicks, n_submit_user, n_submit_pass, username, password):
     Output("login-username", "value"),
     Output("login-password", "value"),
     Output("login-error", "children", allow_duplicate=True),
+    Output("import-modal", "is_open", allow_duplicate=True),
+    Output("datasets-modal", "is_open", allow_duplicate=True),
     Input("btn-logout", "n_clicks"),
     prevent_initial_call=True,
 )
 def do_logout(n):
-    """Cierra la sesión: borra el cache client-side y vuelve al login."""
+    """Cierra la sesión y vuelve al login. Cierra cualquier modal abierto para
+    aterrizar en una pantalla de login limpia (el firstload-modal se cierra solo
+    vía check_dataset_after_login al quedar sin sesión)."""
     if not n:
         raise dash.exceptions.PreventUpdate
-    return None, "", "", ""
+    return None, "", "", "", False, False
 
 
 @app.callback(
@@ -996,6 +1143,18 @@ def show_import_modal(n):
 
 
 @app.callback(
+    Output("import-modal", "is_open", allow_duplicate=True),
+    Input("btn-import-from-empty", "n_clicks"),
+    prevent_initial_call=True,
+)
+def show_import_from_empty(n):
+    """Botón 'Importar Datos' del mensaje 'sin dataset' dentro del dashboard."""
+    if n:
+        return True
+    return dash.no_update
+
+
+@app.callback(
     Output("tab-content-container", "children"),
     Output("main-dashboard-container", "style", allow_duplicate=True),
     Input("tabs-stakeholders", "active_tab"),
@@ -1014,10 +1173,11 @@ def show_import_modal(n):
 )
 def update_view(tab, year_from, year_to, period_mode, years_multi, months_multi,
                 sources, companies, products, actions, sentiment, proc_status):
-    if not os.path.exists(TARGET_DB_PATH):
-        return html.Div(), {"display": "none"}
-    if proc_status.get("status") == "processing":
+    if proc_status.get("status") in ("processing", "deleting"):
         return dash.no_update, dash.no_update
+    # Sin datos (p. ej. tras eliminar todos): mostrar el dashboard con el mensaje.
+    if not _has_dataset():
+        return _no_dataset_view(), {"display": "block"}
 
     filters = {
         "sources": sources, "companies": companies, "products": products,
@@ -1068,9 +1228,9 @@ def populate_filters_adaptive(
 ):
     empty = ([], [], [], [], [], [], [])
 
-    if not os.path.exists(TARGET_DB_PATH):
+    if not _has_dataset():
         return empty
-    if proc_status and proc_status.get("status") == "processing":
+    if proc_status and proc_status.get("status") in ("processing", "deleting"):
         return empty
 
     # Construir el dict de filtros activos con el mismo formato
@@ -1167,10 +1327,10 @@ def render_datasets_modal_body(is_open, refresh, proc_status):
     ]
 
     if proc_status and proc_status.get("status") == "processing":
-        children.append(html.Div([
-            dbc.Spinner(size="sm", color="primary", spinner_class_name="me-2"),
-            html.Span("Importando dataset…", style={"fontSize": "0.82rem", "color": COLOR_PRIMARY}),
-        ], style={"marginTop": "14px"}))
+        children.append(html.Div(
+            _processing_indicator("Importando dataset…"),
+            style={"marginTop": "14px"},
+        ))
 
     return html.Div(children)
 
@@ -1217,41 +1377,33 @@ def render_overlay_datasets(refresh, proc_status):
 
 
 @app.callback(
-    Output("dataset-refresh", "data"),
     Output("processing-status", "data", allow_duplicate=True),
-    Output("import-modal", "is_open", allow_duplicate=True),
-    Output("main-dashboard-container", "style", allow_duplicate=True),
+    Output("delete-status", "children"),
     Input("btn-delete-selected", "n_clicks"),
     Input("btn-delete-all-datasets", "n_clicks"),
     State("dataset-checklist", "value"),
-    State("dataset-refresh", "data"),
     prevent_initial_call=True,
 )
-def handle_dataset_deletion(n_sel, n_all, selected_ids, refresh_count):
+def handle_dataset_deletion(n_sel, n_all, selected_ids):
+    """Dispara el borrado en segundo plano y muestra la rueda + barra girando.
+
+    La finalización (refrescar lista, cerrar/mantener modales) la maneja
+    check_delete vía polling, para que el indicador sea siempre visible.
+    """
     ctx = dash.callback_context
     if not ctx.triggered:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update
 
     triggered_id = ctx.triggered[0]["prop_id"].split(".")[0]
 
     if triggered_id == "btn-delete-all-datasets":
-        delete_all_datasets()
+        threading.Thread(target=_bg_delete, args=(None, True)).start()
     elif triggered_id == "btn-delete-selected" and selected_ids:
-        for did in selected_ids:
-            delete_dataset(int(did))
+        threading.Thread(target=_bg_delete, args=(list(selected_ids), False)).start()
     else:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update
 
-    clear_cache()
-    remaining = get_datasets()
-    new_count = (refresh_count or 0) + 1
-
-    if not remaining:
-        if os.path.exists(TARGET_DB_PATH):
-            os.remove(TARGET_DB_PATH)
-        return new_count, {"status": "ready"}, True, {"display": "none"}
-
-    return new_count, {"status": "ready"}, dash.no_update, dash.no_update
+    return {"status": "deleting"}, _processing_indicator("Eliminando dataset…", color="danger")
 
 
 # =============================================================================
@@ -1274,6 +1426,33 @@ def _bg_process(dataset_name: str):
         _write_etl_status(f"error: {e}")
 
 
+def _write_delete_status(text: str):
+    with open("delete_status.txt", "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _bg_delete(selected_ids, delete_all: bool):
+    """Elimina datasets en segundo plano y deja una marca de estado para el polling."""
+    try:
+        if delete_all:
+            delete_all_datasets()
+        elif selected_ids:
+            for did in selected_ids:
+                delete_dataset(int(did))
+        clear_cache()
+        # No forzamos el borrado del archivo .db: en Windows suele quedar bloqueado
+        # por conexiones SQLite (WinError 32). Lo dejamos vacío —get_datasets() es la
+        # fuente de verdad de "hay datos"— e intentamos limpiarlo best-effort.
+        if not get_datasets():
+            try:
+                os.remove(TARGET_DB_PATH)
+            except OSError:
+                pass
+        _write_delete_status("ok")
+    except Exception as e:
+        _write_delete_status(f"error: {e}")
+
+
 @app.callback(
     Output("processing-status", "data"),
     Output("upload-status-message", "children"),
@@ -1291,10 +1470,7 @@ def handle_upload(contents, name):
             f.write(base64.b64decode(encoded))
         dataset_name = os.path.splitext(name)[0] if name else "Dataset"
         threading.Thread(target=_bg_process, args=(dataset_name,)).start()
-        return {"status": "processing"}, html.Span([
-            dbc.Spinner(size="sm", color="primary", spinner_class_name="me-2"),
-            "Ingestando datos corporativos…",
-        ])
+        return {"status": "processing"}, _processing_indicator()
     except Exception as e:
         return {"status": "error"}, dbc.Alert(f"Fallo: {e}", color="danger")
 
@@ -1319,10 +1495,56 @@ def handle_local_path(n_clicks, path):
         shutil.copy2(path, UPLOADED_ZIP_PATH)
         dataset_name = os.path.splitext(os.path.basename(path))[0]
         threading.Thread(target=_bg_process, args=(dataset_name,)).start()
-        return {"status": "processing"}, html.Span([
-            dbc.Spinner(size="sm", color="primary", spinner_class_name="me-2"),
-            "Ingestando datos corporativos…",
-        ])
+        return {"status": "processing"}, _processing_indicator()
+    except Exception as e:
+        return {"status": "error"}, dbc.Alert(f"Fallo: {e}", color="danger")
+
+
+@app.callback(
+    Output("processing-status", "data", allow_duplicate=True),
+    Output("firstload-status", "children"),
+    Input("firstload-upload", "contents"),
+    State("firstload-upload", "filename"),
+    prevent_initial_call=True,
+)
+def handle_firstload_upload(contents, name):
+    """Carga inicial vía drag-and-drop en el firstload-modal (espeja handle_upload)."""
+    if not contents or not name.lower().endswith(".zip"):
+        return dash.no_update, dbc.Alert("Solo se aceptan archivos .ZIP", color="danger")
+    try:
+        _, encoded = contents.split(',')
+        cleanup_staging()
+        with open(UPLOADED_ZIP_PATH, "wb") as f:
+            f.write(base64.b64decode(encoded))
+        dataset_name = os.path.splitext(name)[0] if name else "Dataset"
+        threading.Thread(target=_bg_process, args=(dataset_name,)).start()
+        return {"status": "processing"}, _processing_indicator()
+    except Exception as e:
+        return {"status": "error"}, dbc.Alert(f"Fallo: {e}", color="danger")
+
+
+@app.callback(
+    Output("processing-status", "data", allow_duplicate=True),
+    Output("firstload-status", "children", allow_duplicate=True),
+    Input("firstload-btn-local", "n_clicks"),
+    State("firstload-local-path", "value"),
+    prevent_initial_call=True,
+)
+def handle_firstload_local(n_clicks, path):
+    """Carga inicial vía ruta local en el firstload-modal (espeja handle_local_path)."""
+    if not path or not path.strip():
+        return dash.no_update, dbc.Alert("Ingresá una ruta válida.", color="warning")
+    path = path.strip().strip('"').strip("'")
+    if not os.path.isfile(path):
+        return dash.no_update, dbc.Alert(f"Archivo no encontrado: {path}", color="danger")
+    if not zipfile.is_zipfile(path):
+        return dash.no_update, dbc.Alert("El archivo no es un ZIP válido.", color="danger")
+    try:
+        cleanup_staging()
+        shutil.copy2(path, UPLOADED_ZIP_PATH)
+        dataset_name = os.path.splitext(os.path.basename(path))[0]
+        threading.Thread(target=_bg_process, args=(dataset_name,)).start()
+        return {"status": "processing"}, _processing_indicator()
     except Exception as e:
         return {"status": "error"}, dbc.Alert(f"Fallo: {e}", color="danger")
 
@@ -1331,31 +1553,83 @@ def handle_local_path(n_clicks, path):
     Output("processing-status", "data", allow_duplicate=True),
     Output("upload-status-message", "children", allow_duplicate=True),
     Output("import-modal", "is_open", allow_duplicate=True),
+    Output("firstload-status", "children", allow_duplicate=True),
+    Output("firstload-modal", "is_open", allow_duplicate=True),
     Input("status-interval", "n_intervals"),
     State("processing-status", "data"),
     prevent_initial_call=True,
 )
 def check_processing(n, curr):
     if curr.get("status") != "processing":
-        return dash.no_update, dash.no_update, dash.no_update
+        return (dash.no_update,) * 5
     if os.path.exists("etl_status.txt"):
         with open("etl_status.txt", "r", encoding="utf-8") as f:
             res = f.read()
         os.remove("etl_status.txt")
         if res == "success":
-            return {"status": "ready"}, html.Span([
+            msg = html.Span([
                 html.I(className="bi bi-check-circle-fill me-2", style={"color": COLOR_SUCCESS}),
                 "¡Datos cargados exitosamente!",
-            ]), False
+            ])
+            # Cierra ambos modales (navbar y carga inicial) al haber datos.
+            return {"status": "ready"}, msg, False, msg, False
         if res.startswith("duplicate:"):
-            msg = res[len("duplicate:"):].strip()
-            return {"status": "ready"}, dbc.Alert(
-                [html.I(className="bi bi-files me-2"), msg],
+            txt = res[len("duplicate:"):].strip()
+            msg = dbc.Alert(
+                [html.I(className="bi bi-files me-2"), txt],
                 color="warning", className="mb-0",
                 style={"fontSize": "0.85rem", "borderRadius": "10px"},
-            ), dash.no_update
-        return {"status": "error"}, dbc.Alert(f"Fallo: {res}", color="danger"), dash.no_update
-    return dash.no_update, dash.no_update, dash.no_update
+            )
+            return {"status": "ready"}, msg, dash.no_update, msg, dash.no_update
+        msg = dbc.Alert(f"Fallo: {res}", color="danger")
+        return {"status": "error"}, msg, dash.no_update, msg, dash.no_update
+    return (dash.no_update,) * 5
+
+
+@app.callback(
+    Output("processing-status", "data", allow_duplicate=True),
+    Output("dataset-refresh", "data", allow_duplicate=True),
+    Output("datasets-modal", "is_open", allow_duplicate=True),
+    Output("main-dashboard-container", "style", allow_duplicate=True),
+    Output("delete-status", "children", allow_duplicate=True),
+    Input("status-interval", "n_intervals"),
+    State("processing-status", "data"),
+    State("dataset-refresh", "data"),
+    prevent_initial_call=True,
+)
+def check_delete(n, curr, refresh_count):
+    """Polling de la eliminación en segundo plano: al terminar, refresca y ordena
+    los modales. Si no quedan datos, cierra Gestión y deja que firstload-modal se
+    abra solo; si quedan, mantiene Gestión abierto con el aviso de completado."""
+    if (curr or {}).get("status") != "deleting":
+        return (dash.no_update,) * 5
+    if not os.path.exists("delete_status.txt"):
+        return (dash.no_update,) * 5
+
+    with open("delete_status.txt", "r", encoding="utf-8") as f:
+        res = f.read()
+    os.remove("delete_status.txt")
+    new_count = (refresh_count or 0) + 1
+
+    if res.startswith("error"):
+        err = dbc.Alert(
+            f"Fallo al eliminar: {res[len('error:'):].strip()}",
+            color="danger", className="mb-0 py-2",
+            style={"fontSize": "0.82rem", "borderRadius": "10px"},
+        )
+        return {"status": "ready"}, new_count, dash.no_update, dash.no_update, err
+
+    if not get_datasets():
+        # Sin datos: cerrar Gestión y mostrar el dashboard con el mensaje
+        # 'sin dataset' (update_view lo renderiza al pasar a 'ready').
+        return {"status": "ready"}, new_count, False, {"display": "block"}, ""
+
+    done_msg = dbc.Alert(
+        [html.I(className="bi bi-check-circle-fill me-2"), "Eliminación completada."],
+        color="success", className="mb-0 py-2",
+        style={"fontSize": "0.82rem", "borderRadius": "10px"},
+    )
+    return {"status": "ready"}, new_count, dash.no_update, dash.no_update, done_msg
 
 
 @app.callback(
@@ -1363,7 +1637,7 @@ def check_processing(n, curr):
     Input("processing-status", "data"),
 )
 def toggle_status_interval(status):
-    return (status or {}).get("status") != "processing"
+    return (status or {}).get("status") not in ("processing", "deleting")
 
 
 # =============================================================================
@@ -1408,7 +1682,7 @@ def render_marketing(filters: dict) -> html.Div:
     col_det = dbc.Col(kpi_card(det_str, "Detractores", STYLE_KPI_DANGER if total > 0 else STYLE_KPI, subtitle=det_sub), md=3)
 
     # GRAPH 1: Quarterly Trend
-    if df_vel.empty or df_vel["quejas"].sum() == 0:
+    if df_vel.is_empty() or df_vel["quejas"].sum() == 0:
         col_vel = dbc.Col(empty_state(vel_title), md=8)
     else:
         fig_vel = go.Figure()
@@ -1426,13 +1700,13 @@ def render_marketing(filters: dict) -> html.Div:
         col_vel = dbc.Col(_G(fig_vel), md=8)
 
     # GRAPH 2: NPS Breakdown
-    if total == 0 or nps["breakdown_df"].empty:
+    if total == 0 or nps["breakdown_df"].is_empty():
         col_nps_graph = dbc.Col(empty_state(nps_title), md=4)
     else:
         fig_nps = go.Figure()
         total_sig = total or 1
         seg_colors = {"Promotores": COLOR_SUCCESS, "Pasivos": COLOR_NEUTRAL_2, "Detractores": COLOR_DANGER}
-        for _, row in nps["breakdown_df"].iterrows():
+        for row in nps["breakdown_df"].iter_rows(named=True):
             pct = round(row["Cantidad"] / total_sig * 100, 1)
             fig_nps.add_trace(go.Bar(
                 x=[pct], y=["Clientes"], name=row["Segmento"], orientation="h",
@@ -1446,7 +1720,7 @@ def render_marketing(filters: dict) -> html.Div:
         col_nps_graph = dbc.Col(_G(fig_nps), md=4)
 
     # GRAPH 3: Sentiment by Channel
-    if df_sent.empty:
+    if df_sent.is_empty():
         col_sent = dbc.Col(empty_state(sent_title), md=6)
     else:
         bar_colors = [COLOR_DANGER if v < 0 else (COLOR_WARNING if v < 0.1 else COLOR_SUCCESS) for v in df_sent["avg_sentiment"]]
@@ -1464,7 +1738,7 @@ def render_marketing(filters: dict) -> html.Div:
         ]), md=6)
 
     # GRAPH 4: Platform Impact
-    if df_impact.empty or (df_impact["pct_positive"].sum() == 0 and df_impact["pct_negative"].sum() == 0):
+    if df_impact.is_empty() or (df_impact["pct_positive"].sum() == 0 and df_impact["pct_negative"].sum() == 0):
         col_impact = dbc.Col(empty_state(impact_title), md=6)
     else:
         fig_impact = px.bar(
@@ -1477,7 +1751,7 @@ def render_marketing(filters: dict) -> html.Div:
         col_impact = dbc.Col(_G(fig_impact), md=6)
 
     # GRAPH 5: Peaks
-    if df_peaks.empty or df_peaks["volumen"].sum() == 0:
+    if df_peaks.is_empty() or df_peaks["volumen"].sum() == 0:
         col_peaks = dbc.Col(empty_state(peaks_title), md=12)
     else:
         fig_peaks = px.bar(df_peaks, x="mes_label", y="volumen", title=peaks_title, labels={"mes_label": "Mes", "volumen": "Señales"})
@@ -1524,7 +1798,7 @@ def render_general_direction(filters: dict) -> html.Div:
     col_reg_kpi = dbc.Col(kpi_card(reg_str, "Exposición Regulatoria (CFPB)", reg_style, subtitle=reg_sub), md=4)
 
     # KPI 3: Pre-churn
-    prechurn_total = int(df_pre["prechurn"].sum()) if not df_pre.empty else 0
+    prechurn_total = int(df_pre["prechurn"].sum()) if not df_pre.is_empty() else 0
     pre_str = f"{prechurn_total:,}" if prechurn_total > 0 else "—"
     pre_sub = "Clientes buscando alternativas o reaccionando a cambios de precio o política" if prechurn_total > 0 \
               else "Sin datos para los filtros seleccionados"
@@ -1532,7 +1806,7 @@ def render_general_direction(filters: dict) -> html.Div:
 
     # GRAPH 1: Churn Donut
     dist_df = kpis["distribucion"]
-    if churn_total == 0 or dist_df.empty:
+    if churn_total == 0 or dist_df.is_empty():
         col_churn_graph = dbc.Col(empty_state(churn_title), md=5)
     else:
         fig_churn = px.pie(dist_df, values="cantidad", names="causa_label", hole=0.5, title=churn_title, labels={"causa_label": "Motivo de Salida", "cantidad": "Clientes Afectados"})
@@ -1541,7 +1815,7 @@ def render_general_direction(filters: dict) -> html.Div:
         col_churn_graph = dbc.Col(_G(fig_churn), md=5)
 
     # GRAPH 2: Pre-churn Trend
-    if df_pre.empty or prechurn_total == 0:
+    if df_pre.is_empty() or prechurn_total == 0:
         col_pre_graph = dbc.Col(empty_state(pre_title), md=7)
     else:
         fig_pre = go.Figure()
@@ -1555,12 +1829,13 @@ def render_general_direction(filters: dict) -> html.Div:
         col_pre_graph = dbc.Col(_G(fig_pre), md=7)
 
     # GRAPH 3: Benchmark
-    if df_bench.empty:
+    if df_bench.is_empty():
         col_bench = dbc.Col(empty_state(bench_title), md=6)
     else:
-        df_b = df_bench.copy()
-        df_b["sat_score"] = ((df_b["avg_sentiment"] + 1) / 2 * 100).round(1)
-        df_b = df_b.sort_values("sat_score", ascending=False)
+        df_b = df_bench.with_columns(
+            (((pl.col("avg_sentiment") + 1) / 2 * 100).round(1)).alias("sat_score")
+        )
+        df_b = df_b.sort("sat_score", descending=True)
         bar_colors = [COLOR_DANGER if v < 40 else (COLOR_WARNING if v < 55 else COLOR_SUCCESS) for v in df_b["sat_score"]]
         fig_bench = go.Figure(go.Bar(
             x=df_b["sat_score"], y=df_b["company"], orientation="h", marker_color=bar_colors,
@@ -1576,36 +1851,64 @@ def render_general_direction(filters: dict) -> html.Div:
         ]), md=6)
 
     # GRAPH 4: Heatmap
-    if df_heat.empty:
+    if df_heat.is_empty():
         col_heat = dbc.Col(empty_state(heat_title), md=6)
     else:
-        df_hd = df_heat.copy()
-        df_hd["sat_score"] = ((df_hd["avg_sentiment"] + 1) / 2 * 100).round(0)
-        top_cos = df_hd.groupby("company")["sat_score"].count().nlargest(8).index
-        df_hd = df_hd[df_hd["company"].isin(top_cos)]
-        pivot = df_hd.pivot_table(index="company", columns="product_service", values="sat_score", aggfunc="mean")
-        
-        if pivot.empty:
+        df_hd = df_heat.with_columns(
+            (((pl.col("avg_sentiment") + 1) / 2 * 100).round(0)).alias("sat_score")
+        )
+        top_cos = (
+            df_hd.group_by("company")
+            .agg(pl.col("sat_score").count().alias("cnt"))
+            .sort("cnt", descending=True)
+            .head(8)["company"]
+            .to_list()
+        )
+        df_hd = df_hd.filter(pl.col("company").is_in(top_cos))
+        # pivot: filas = company, columnas = product_service, valores = media de sat_score
+        pivot = df_hd.pivot(
+            on="product_service", index="company", values="sat_score",
+            aggregate_function="mean",
+        )
+
+        if pivot.is_empty() or pivot.width <= 1:
             col_heat = dbc.Col(empty_state(heat_title), md=6)
         else:
-            text_matrix = [[f"{v:.0f}%" if not pd.isna(v) else "" for v in row] for row in pivot.values]
+            import math
+            full_cols = [c for c in pivot.columns if c != "company"]
+            companies = pivot["company"].to_list()
+            z = pivot.select(full_cols).to_numpy()
+            text_matrix = [
+                ["" if (v is None or (isinstance(v, float) and math.isnan(v))) else f"{v:.0f}%" for v in row]
+                for row in z
+            ]
+            # Etiquetas largas de producto: se truncan para mostrar, el nombre
+            # completo queda en el hover via customdata.
+            x_labels = [c if len(str(c)) <= 26 else str(c)[:25].rstrip() + "…" for c in full_cols]
+            customdata = [[c for c in full_cols] for _ in range(len(companies))]
             fig_heat = go.Figure(data=go.Heatmap(
-                z=pivot.values, x=pivot.columns.tolist(), y=pivot.index.tolist(), text=text_matrix,
+                z=z, x=x_labels, y=companies, text=text_matrix,
+                customdata=customdata,
                 texttemplate="%{text}", textfont=dict(size=11, family=FONT_FAMILY),
                 colorscale=[[0, COLOR_DANGER], [0.4, "#FFB68A"], [0.5, "#F5F5F5"], [0.6, "#AED490"], [1, COLOR_SUCCESS]],
                 zmin=0, zmax=100, zmid=50, colorbar=dict(title="Satisf. %", tickfont=dict(family=FONT_FAMILY), ticksuffix="%"),
-                hovertemplate="<b>%{y}</b><br>Producto: %{x}<br>Satisfacción: %{z:.0f}%<extra></extra>",
+                hovertemplate="<b>%{y}</b><br>Producto: %{customdata}<br>Satisfacción: %{z:.0f}%<extra></extra>",
             ))
-            fig_heat.update_layout(title=heat_title, font=dict(family=FONT_FAMILY), annotations=[dict(
-                text="0% = muy insatisfechos · 50% = neutro · 100% = muy satisfechos",
-                x=0.5, y=-0.20, xref="paper", yref="paper", showarrow=False,
-                font=dict(size=10, color=COLOR_NEUTRAL_2, family=FONT_FAMILY),
-            )])
+            fig_heat.update_layout(title=heat_title, font=dict(family=FONT_FAMILY))
             fig_heat = apply_corporate_layout(fig_heat, margin=dict(l=160, b=130), hide_x_title=True, hide_y_title=True)
+            # Inclinación fija + automargin: el eje se adapta al ancho disponible
+            # sin que las etiquetas se corten ni pisen la leyenda.
+            fig_heat.update_xaxes(tickangle=-35, automargin=True)
+            fig_heat.update_yaxes(automargin=True)
+            # La escala de color y la nota metodológica van como pie de gráfico
+            # (fuera de la figura) para no superponerse con las etiquetas del eje X.
             col_heat = dbc.Col(html.Div([
                 _G(fig_heat),
-                html.P("Agrupado por promedio de sentimiento. El filtro de Acción reduce el volumen disponible.",
-                       style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"})
+                html.P([
+                    "0% = muy insatisfechos · 50% = neutro · 100% = muy satisfechos.",
+                    html.Br(),
+                    "Agrupado por promedio de sentimiento. El filtro de Acción reduce el volumen disponible.",
+                ], style={"fontSize": "0.7rem", "color": COLOR_NEUTRAL_2, "marginTop": "4px"})
             ]), md=6)
 
     warnings = []
@@ -1642,7 +1945,7 @@ def render_retention(filters: dict) -> html.Div:
 
     # GRAPH 1: Radar
     radar_title = "Productos con Mayor Riesgo de Deserción"
-    if df_radar.empty or len(df_radar) < 3:
+    if df_radar.is_empty() or df_radar.height < 3:
         col_radar = dbc.Col(empty_state(radar_title), md=6)
     else:
         fig_radar = go.Figure()
@@ -1660,7 +1963,7 @@ def render_retention(filters: dict) -> html.Div:
 
     # GRAPH 2: Topics
     topics_title = "Principales Motivos de Queja"
-    if df_topics.empty or df_topics["Frecuencia"].sum() == 0:
+    if df_topics.is_empty() or df_topics["Frecuencia"].sum() == 0:
         col_topics = dbc.Col(empty_state(topics_title), md=6)
     else:
         fig_topics = px.bar(df_topics, x="Frecuencia", y="Topic", orientation="h", title=topics_title, labels={"Frecuencia": "Menciones en Reseñas", "Topic": "Categoría"})
@@ -1670,7 +1973,7 @@ def render_retention(filters: dict) -> html.Div:
 
     # GRAPH 3: Map
     map_title = "Concentración Geográfica de Quejas"
-    if df_map.empty or df_map["quejas"].sum() == 0:
+    if df_map.is_empty() or df_map["quejas"].sum() == 0:
         col_map = dbc.Col(empty_state(map_title), md=12)
     else:
         fig_map = px.bar(df_map, x="estado", y="quejas", title=map_title, labels={"estado": "Estado / Región", "quejas": "Quejas Registradas"})
@@ -1750,7 +2053,7 @@ def render_product_team(filters: dict) -> html.Div:
 
     # GRAPH 1: Device Comparison
     dev_title = "Satisfacción vs Calificación por Plataforma"
-    if df_dev.empty:
+    if df_dev.is_empty():
         col_dev = dbc.Col(empty_state(dev_title), md=6)
     else:
         fig_dev = go.Figure()
@@ -1780,14 +2083,14 @@ def render_product_team(filters: dict) -> html.Div:
 
     # GRAPH 2: Star distribution
     stars_title = "Distribución de Calificaciones"
-    if df_stars.empty or df_stars["cantidad"].sum() == 0:
+    if df_stars.is_empty() or df_stars["cantidad"].sum() == 0:
         col_stars = dbc.Col(empty_state(stars_title), md=6)
     else:
         star_colors = [COLOR_DANGER, COLOR_DANGER, COLOR_WARNING, COLOR_SUCCESS, COLOR_SUCCESS]
         fig_stars = go.Figure()
         fig_stars.add_trace(go.Bar(
             x=df_stars["estrella_label"], y=df_stars["cantidad"],
-            marker_color=star_colors[:len(df_stars)],
+            marker_color=star_colors[:df_stars.height],
             hovertemplate="<b>%{x}</b><br>Reseñas: %{y:,}<extra></extra>",
         ))
         fig_stars.update_layout(title=stars_title + " — App Store & Google Play")
@@ -1796,7 +2099,7 @@ def render_product_team(filters: dict) -> html.Div:
 
     # GRAPH 3: NLP Issues
     nlp_title = "Problemas Técnicos Más Reportados"
-    if df_nlp.empty or df_nlp["Frecuencia"].sum() == 0:
+    if df_nlp.is_empty() or df_nlp["Frecuencia"].sum() == 0:
         col_nlp = dbc.Col(empty_state(nlp_title), md=6)
     else:
         fig_nlp = px.bar(df_nlp, x="Frecuencia", y="Problema", orientation="h", title=nlp_title, labels={"Frecuencia": "Cantidad de Reportes", "Problema": "Tipo de Problema"})
@@ -1806,7 +2109,7 @@ def render_product_team(filters: dict) -> html.Div:
 
     # GRAPH 4: YoY Trend
     yoy_title = "Tendencia Anual: Volumen de Reseñas vs Satisfacción"
-    if df_yoy.empty:
+    if df_yoy.is_empty():
         col_yoy = dbc.Col(empty_state(yoy_title), md=6)
     else:
         fig_yoy = go.Figure()

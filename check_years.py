@@ -1,15 +1,9 @@
-import sqlite3
-import pandas as pd
-
-db_path = r'C:\Users\joaco\OneDrive\Desktop\DashView\data\dashview.db'
-conn = sqlite3.connect(db_path)
+from src.database_manager import _sql_to_polars
 
 print("--- GooglePlay years ---")
 q = "SELECT year, COUNT(*) FROM client_signals WHERE source='GooglePlay' GROUP BY year"
-print(pd.read_sql_query(q, conn))
+print(_sql_to_polars(q, []))
 
 print("\n--- AppStore years ---")
 q = "SELECT year, COUNT(*) FROM client_signals WHERE source='AppStore' GROUP BY year"
-print(pd.read_sql_query(q, conn))
-
-conn.close()
+print(_sql_to_polars(q, []))

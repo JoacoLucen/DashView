@@ -1,7 +1,11 @@
 import os
 import sqlite3
-import pandas as pd
+import polars as pl
 import functools
+import json
+import pickle
+import hashlib
+import threading
 
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(_current_dir, "..", "data", "dashview.db")
@@ -73,32 +77,159 @@ def _build_dynamic_query(base_query: str, filters: dict) -> tuple:
     return full_query, params
 
 
+def _sql_to_polars(query: str, params) -> pl.DataFrame:
+    """Ejecuta una consulta parametrizada en SQLite y devuelve un polars.DataFrame.
+
+    Se usa un cursor de sqlite3 (en vez de pl.read_database) para tener control
+    total sobre los parámetros posicionales y un manejo simple del caso vacío.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        cur = conn.execute(query, params)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    if not rows:
+        return pl.DataFrame({c: [] for c in cols})
+    return pl.DataFrame(rows, schema=cols, orient="row")
+
+
 @functools.lru_cache(maxsize=128)
-def _execute_query_cached(base_query: str, filters_tuple: tuple) -> pd.DataFrame:
+def _execute_query_cached(base_query: str, filters_tuple: tuple) -> pl.DataFrame:
     filters = dict(filters_tuple) if filters_tuple else {}
     query, params = _build_dynamic_query(base_query, filters)
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("PRAGMA busy_timeout = 5000")
-            return pd.read_sql_query(query, conn, params=params)
+        return _sql_to_polars(query, params)
     except sqlite3.Error as e:
         print(f"[DB Error] SQL: {query}")
         raise RuntimeError(f"Error en BD: {e}")
 
 
-def _execute_query(base_query: str, filters: dict = None) -> pd.DataFrame:
+def _execute_query(base_query: str, filters: dict = None) -> pl.DataFrame:
     filters_tuple = ()
     if filters:
         filters_tuple = tuple(
             sorted((k, tuple(v) if isinstance(v, list) else v) for k, v in filters.items())
         )
-    return _execute_query_cached(base_query, filters_tuple).copy()
+    return _execute_query_cached(base_query, filters_tuple).clone()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Caché de RESULTADOS de métricas (memoria + disco)
+#
+# El lru_cache de arriba solo cachea el SQL crudo y se pierde al reiniciar el
+# proceso. Esta capa cachea el resultado FINAL de cada métrica (incluido el
+# post-procesamiento en polars, p. ej. los conteos por regex de 20.000 textos)
+# y lo persiste en disco. Así recargar la página —o reiniciar el server— no
+# recalcula nada mientras el dataset no cambie.
+#
+# Doble invalidación: la clave incluye la fecha de modificación del .db (si
+# cambian los datos, cambia la clave), y clear_cache() borra todo al importar
+# o eliminar datasets.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RESULT_CACHE_DIR = os.path.join(_current_dir, "..", "data", "cache")
+_result_cache_mem = {}
+_result_cache_lock = threading.Lock()
+
+
+def _db_version() -> str:
+    try:
+        return str(int(os.path.getmtime(DB_PATH)))
+    except OSError:
+        return "0"
+
+
+def _normalize_filters(filters) -> dict:
+    """Normaliza los filtros a su forma efectiva para el cacheo.
+
+    Distintos dicts que producen exactamente la misma consulta deben compartir
+    clave de caché. Por eso se descartan los valores que _build_dynamic_query
+    ignora (None, listas vacías, "" y sentiment="ALL") y se ordenan las listas,
+    ya que el orden de selección no cambia el resultado (cláusulas IN).
+    Así "sin filtro" produce la misma clave aunque el control haya pasado de
+    None a [] tras seleccionar y quitar un valor.
+    """
+    if not filters:
+        return {}
+    norm = {}
+    for k, v in filters.items():
+        if v is None or v == "":
+            continue
+        if isinstance(v, (list, tuple)):
+            if len(v) == 0:
+                continue
+            norm[k] = sorted(v, key=str)
+        elif k == "sentiment" and v == "ALL":
+            continue
+        else:
+            norm[k] = v
+    return norm
+
+
+def _result_cache_key(name: str, filters) -> str:
+    payload = json.dumps(_normalize_filters(filters), sort_keys=True, default=str)
+    digest = hashlib.md5(payload.encode()).hexdigest()
+    return f"{name}.{_db_version()}.{digest}"
+
+
+def _clone_result(val):
+    """Copia defensiva para que quien consume el resultado no mute el caché."""
+    if isinstance(val, pl.DataFrame):
+        return val.clone()
+    if isinstance(val, dict):
+        return {k: (v.clone() if isinstance(v, pl.DataFrame) else v) for k, v in val.items()}
+    return val
+
+
+def cached_result(func):
+    """Cachea el resultado de una métrica por (nombre, versión de datos, filtros)."""
+    @functools.wraps(func)
+    def wrapper(filters=None, *args, **kwargs):
+        key = _result_cache_key(func.__name__, filters)
+        with _result_cache_lock:
+            if key in _result_cache_mem:
+                return _clone_result(_result_cache_mem[key])
+        path = os.path.join(_RESULT_CACHE_DIR, key + ".pkl")
+        try:
+            if os.path.exists(path):
+                with open(path, "rb") as fh:
+                    val = pickle.load(fh)
+                with _result_cache_lock:
+                    _result_cache_mem[key] = val
+                return _clone_result(val)
+        except Exception:
+            pass
+        val = func(filters, *args, **kwargs)
+        with _result_cache_lock:
+            _result_cache_mem[key] = val
+        try:
+            os.makedirs(_RESULT_CACHE_DIR, exist_ok=True)
+            with open(path, "wb") as fh:
+                pickle.dump(val, fh)
+        except Exception:
+            pass
+        return _clone_result(val)
+    return wrapper
 
 
 def clear_cache() -> None:
+    """Invalida todo el caché: SQL en memoria + resultados en memoria + disco."""
     _execute_query_cached.cache_clear()
+    with _result_cache_lock:
+        _result_cache_mem.clear()
+    try:
+        if os.path.isdir(_RESULT_CACHE_DIR):
+            for fn in os.listdir(_RESULT_CACHE_DIR):
+                if fn.endswith(".pkl"):
+                    try:
+                        os.remove(os.path.join(_RESULT_CACHE_DIR, fn))
+                    except OSError:
+                        pass
+    except Exception:
+        pass
 
 
+@cached_result
 def get_filter_options(active_filters: dict) -> dict:
     """
     Dado el estado actual de los filtros activos, retorna las opciones
@@ -115,14 +246,11 @@ def get_filter_options(active_filters: dict) -> dict:
     Cada valor es una lista de dicts {"label": ..., "value": ...}
     ordenada por conteo descendente.
     """
-    import sqlite3
-    import pandas as pd
-
     if not os.path.exists(DB_PATH):
         return {k: [] for k in ['years', 'sources', 'companies', 'products', 'actions']}
 
     def _query_options(dimension_col: str, exclude_key, filters: dict,
-                       min_count: int = 1) -> list:
+                       min_count: int = 1) -> tuple:
         """
         Consulta los valores distintos de dimension_col aplicando todos
         los filtros EXCEPTO el/los filtro(s) de exclude_key (str o iterable).
@@ -142,10 +270,10 @@ def get_filter_options(active_filters: dict) -> dict:
             + f" ORDER BY cnt DESC"
         )
         try:
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("PRAGMA busy_timeout = 5000")
-                df = pd.read_sql_query(query_final, conn, params=params)
-            return df[dimension_col].tolist(), df["cnt"].tolist()
+            df = _sql_to_polars(query_final, params)
+            if df.is_empty():
+                return [], []
+            return df[dimension_col].to_list(), df["cnt"].to_list()
         except Exception as e:
             print(f"[get_filter_options] Error en {dimension_col}: {e}")
             return [], []

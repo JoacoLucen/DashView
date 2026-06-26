@@ -1,7 +1,5 @@
-import os
-import sqlite3
-import pandas as pd
 from src.metrics import get_device_usage_comparison
+from src.database_manager import _sql_to_polars
 
 # Mock filters
 filters = {"period": [2010, 2025]}
@@ -12,8 +10,5 @@ df = get_device_usage_comparison(device_filters)
 print("--- Device Usage Comparison Result ---")
 print(df)
 
-db_path = r'C:\Users\joaco\OneDrive\Desktop\DashView\data\dashview.db'
-conn = sqlite3.connect(db_path)
 print("\n--- Raw Group By Source ---")
-print(pd.read_sql_query("SELECT source, COUNT(*) FROM client_signals GROUP BY source", conn))
-conn.close()
+print(_sql_to_polars("SELECT source, COUNT(*) FROM client_signals GROUP BY source", []))
